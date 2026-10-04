@@ -1,0 +1,676 @@
+---
+title: "A robust Self-Organizing Map for children's movement tasks"
+subtitle: "An improvement of the SOM in Patrikei et al. (2026), *Acta Gymnica*: the same features and pipeline, a more accurate map"
+author: "Andrii Patrikei"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: false
+    toc_depth: 2
+    code_folding: hide
+    theme: flatly
+    highlight: tango
+params:
+  article_rds: "data/som_gain_2_35f_5x5.RDS"   # the article's saved maps; downloaded from its repository if missing
+  quick: false                                 # TRUE = a small plan (few seeds and maps) to test the document in minutes
+  cores: 0                                     # 0 = all but two; used only when results/ lacks a part of the plan
+  save_figures: true                           # also write the static PNGs and the results table used by the README
+---
+
+```{css, echo = FALSE}
+.main-container { max-width: 1120px; }
+body { font-size: 16px; line-height: 1.62; color: #1d1d1b; }
+h1.title { font-size: 34px; margin-top: 18px; }
+h3.subtitle { font-size: 19px; color: #52514e; line-height: 1.4; }
+h1 { font-size: 26px; margin-top: 44px; } h2 { font-size: 20px; margin-top: 30px; }
+.lead { font-size: 18px; line-height: 1.6; }
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 14px; margin: 22px 0 10px; }
+.tile { border: 1px solid #e6e5e0; border-left: 4px solid #eb6834; border-radius: 6px; padding: 12px 16px; background: #fcfcfb; }
+.tile .num { font-size: 30px; font-weight: 700; line-height: 1.15; color: #0b0b0b; }
+.tile .lbl { font-size: 14px; color: #1d1d1b; margin-top: 4px; }
+.tile .sub { font-size: 13px; color: #52514e; margin-top: 2px; }
+.callout { border-left: 4px solid #2a78d6; background: #f3f7fd; padding: 12px 18px; margin: 18px 0 22px; border-radius: 0 6px 6px 0; }
+.callout p:last-child, .callout ul:last-child { margin-bottom: 0; }
+.note { color: #52514e; font-size: 14px; }
+table { font-size: 14px; }
+.table > thead > tr > th, .table > tbody > tr > td { padding: 5px 9px; }
+details summary { cursor: pointer; color: #2a78d6; margin: 8px 0; }
+pre code { font-size: 13px; }
+span.math.display { display: block; overflow-x: auto; overflow-y: hidden; }
+```
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, comment = "#>", fig.align = "center", dpi = 110)
+library(data.table)
+library(ggplot2)
+for (f in c("R/article_metrics.R", "R/som_fits.R", "R/protocols.R", "R/bench.R", "R/plots.R", "R/plots_interactive.R")) source(f)
+load_novel_som()
+cores <- if (params$cores > 0) params$cores else max(1L, parallel::detectCores() - 2L)
+res_dir <- if (params$quick) "results_quick" else "results"
+```
+
+```{r load, include = FALSE}
+# the article's saved maps and feature matrices (downloaded once, checked by md5), the plan, and the results
+D <- article_data(get_article_rds(params$article_rds))
+plan <- if (!params$quick) bench_plan() else {
+  q <- c("kohonen", "euclid:article", "l1_huber:article", "huber:article", "euclid:novel", "huber:novel")
+  list(main_all = make_jobs(names(FEATURE_SETS), 27, c(q, "sbd:article", "dtw:novel", "correlation:article"), 1:3, "all"),
+       main_cv = make_jobs(names(FEATURE_SETS), 27, q, 1:3, c("kfold", "heldout")),
+       curve = make_jobs(names(FEATURE_SETS), c(10, 27), c("kohonen", "l1_huber:article", "euclid:novel"), 1:2, "all"),
+       confirm = make_jobs(names(FEATURE_SETS), 27, c("kohonen", "l1_huber:article"), 101:102, "preds"))
+}
+res <- compute_all(D, plan, cores, dir = res_dir)
+for (p in names(plan)) if (!is.null(attr(res[[p]], "failed"))) stop("failed jobs in ", p)
+stopifnot(nrow(res$main_all) == nrow(plan$main_all), nrow(res$main_cv) == nrow(plan$main_cv),
+          nrow(res$curve) == nrow(plan$curve), nrow(res$confirm) == 648 * nrow(plan$confirm))
+```
+
+```{r analysis, include = FALSE}
+SETS <- FEATURE_SETS
+CV_COLS <- c("kfold_train", "kfold_test", "heldout_super_acc", "heldout_super_bacc", "heldout_unit_acc", "heldout_unit_bacc")
+R <- merge(res$main_all, res$main_cv[, c("set", "n", "method", "seed", CV_COLS), with = FALSE],
+           by = c("set", "n", "method", "seed"), all.x = TRUE)
+MEASURES <- c("QE", "EV", "TE", "KL", "accuracy", "mnLogLoss", "accuracy_euclid", "ari_super", CV_COLS, "seconds")
+long <- melt(R, id.vars = c("set", "n", "method", "seed"), measure.vars = MEASURES, variable.name = "measure")[!is.na(value)]
+S <- long[, .(mean = mean(value), sd = sd(value), min = min(value), max = max(value), seeds = .N), by = .(set, n, method, measure)]
+S <- data.table(S, method_parts(S$method))
+S[, set_label := factor(SETS[set], levels = SETS)]
+pubs <- as.data.table(D$published)[, set_label := factor(SETS[set], levels = SETS)]
+
+# the screening rule, fixed before looking at the results: among the variants whose distance means something on a
+# feature vector, trained with the article's schedule, the best held-out accuracy (super-cluster rule) averaged
+# over the five feature sets
+overall <- dcast(S[n == 27, .(mean = mean(mean)), by = .(method, label, regime, elastic, measure)],
+                 method + label + regime + elastic ~ measure, value.var = "mean")
+best <- overall[regime == "article" & !elastic & !is.na(heldout_super_acc)][order(-heldout_super_acc)]$method[1]
+best_own <- overall[regime == "novel" & !elastic & !is.na(heldout_super_acc)][order(-heldout_super_acc)]$method[1]
+confirmed <- setdiff(unique(plan$confirm$method), "kohonen")
+if (!identical(best, confirmed)) warning("the screening picks ", best, " but the confirmatory run tests ", confirmed)
+CLASSIC <- "kohonen"; ROBUST <- best
+kh <- overall[method == CLASSIC]; rb <- overall[method == ROBUST]; ow <- overall[method == best_own]
+per_set <- function(me, m, nn = 27) setNames(S[n == nn & measure == me & method == m][match(names(SETS), set)]$mean, names(SETS))
+f3 <- function(x) sprintf("%.3f", x)
+pts <- function(x) sub("^[-+]0[.]0$", "0.0", sprintf("%+.1f", 100 * x))   # percentage points, no sign on a zero
+
+# robust minus classical, per feature set and measure, with a 95% Welch interval over the seeds
+DD <- rbindlist(lapply(c("heldout_super_acc", "accuracy", "heldout_unit_acc", "kfold_test", "heldout_super_bacc"), function(me)
+  rbindlist(lapply(names(SETS), function(s) {
+    v <- R[n == 27 & set == s & method == ROBUST & !is.na(get(me))][[me]]; k <- R[n == 27 & set == s & method == CLASSIC & !is.na(get(me))][[me]]
+    ci <- if (length(v) > 2 && sd(c(v, k)) > 0) t.test(v, k)$conf.int else c(NA, NA)
+    data.table(set = s, measure = me, robust = mean(v), classic = mean(k), diff = mean(v) - mean(k), lo = ci[1], hi = ci[2], seeds = length(v))
+  }))))
+DD[, set_label := factor(SETS[set], levels = SETS)]
+d_ho <- DD[measure == "heldout_super_acc"]; d_all <- DD[measure == "accuracy"]
+sets_ho <- d_ho[!is.na(lo) & lo > 0]$set; sets_all <- d_all[!is.na(lo) & lo > 0]$set
+level_ho <- setdiff(names(SETS), sets_ho)
+and_list <- function(x) if (length(x) <= 1) paste(x, collapse = "") else paste(paste(x[-length(x)], collapse = ", "), "and", x[length(x)])
+ho_cl <- per_set("heldout_super_acc", CLASSIC); ho_rb <- per_set("heldout_super_acc", ROBUST)
+spec_beats_all <- ho_rb[["spectr"]] > max(ho_cl)
+
+# child by child, on the fresh seeds of the confirmatory run
+CF <- copy(res$confirm)[, `:=`(ok_super = pred_super == y7, ok_unit = pred_unit == y7)]
+seed_acc <- CF[, .(super = mean(ok_super), unit = mean(ok_unit)), by = .(set, method, seed)]
+child_acc <- CF[, .(super = mean(ok_super), unit = mean(ok_unit)), by = .(set, method, child)]
+child_test <- function(classic, robust) {
+  d <- robust - classic; set.seed(1)
+  boot <- replicate(10000, mean(sample(d, replace = TRUE)))
+  p <- if (any(d != 0)) suppressWarnings(wilcox.test(robust, classic, paired = TRUE, exact = FALSE))$p.value else 1
+  data.table(better = sum(d > 0), worse = sum(d < 0), equal = sum(d == 0), mean_gain = mean(d),
+             lo = unname(quantile(boot, 0.025)), hi = unname(quantile(boot, 0.975)), p = p)
+}
+CT <- rbindlist(lapply(c("super", "unit"), function(rule) rbindlist(lapply(names(SETS), function(s) {
+  x <- dcast(child_acc[set == s], child ~ method, value.var = rule)
+  cbind(set = s, rule = rule, child_test(x[[CLASSIC]], x[[ROBUST]]))
+}))))
+CT[, p_holm := p.adjust(p, "holm"), by = rule]
+CT[, set_label := factor(SETS[set], levels = SETS)]
+PC <- dcast(child_acc, set + child ~ method, value.var = "super")
+setnames(PC, c(CLASSIC, ROBUST), c("classic", "robust"))
+PC[, set_label := factor(SETS[set], levels = SETS)]
+n_children <- length(unique(D$child))
+ct_spec <- CT[rule == "super" & set == "spectr"]; ct_ts <- CT[rule == "super" & set == "tsfresh"]
+rep_acc <- seed_acc[, .(super = mean(super), unit = mean(unit)), by = .(set, method)]
+n_all <- res$main_all[method == CLASSIC, uniqueN(seed)]; n_cv <- res$main_cv[method == CLASSIC, uniqueN(seed)]
+n_conf <- res$confirm[method == CLASSIC, uniqueN(seed)]; conf_seeds <- range(res$confirm$seed)
+# the article's way of reading the robust codebook (Euclidean winners, PAM): how often it still beats kohonen
+eu_rb <- per_set("accuracy_euclid", ROBUST); eu_cl <- per_set("accuracy_euclid", CLASSIC)
+```
+
+<p class="lead">
+The article clustered 648 movement segments (81 children, 7 tasks, crawling recorded twice) with a classical
+Kohonen Self-Organizing Map and judged how well its clusters recover the tasks. Here the map alone is
+replaced by a **robust SOM** from [novel_SOM](https://github.com/andrii-patrikei/novel_SOM): the winning unit is
+chosen by the Manhattan distance, every update step is clipped at one standard deviation, and the training
+schedule is exactly the article's. The features, the 5&times;5 map, the 7 super-clusters and the accuracy measure
+are the article's own, read from its saved models.
+</p>
+
+<div class="tiles">
+<div class="tile"><div class="num">`r pts(rb$heldout_super_acc - kh$heldout_super_acc)` points</div>
+<div class="lbl">accuracy on children the map has never seen, mean of the 5 feature sets</div>
+<div class="sub">from `r f3(kh$heldout_super_acc)` to `r f3(rb$heldout_super_acc)`</div></div>
+<div class="tile"><div class="num">`r pts(per_set("heldout_super_acc", ROBUST)[["spectr"]] - per_set("heldout_super_acc", CLASSIC)[["spectr"]])` points</div>
+<div class="lbl">on the spectral features, the largest gain</div>
+<div class="sub">from `r f3(ho_cl[["spectr"]])` to `r f3(ho_rb[["spectr"]])``r if (spec_beats_all) ", above the classical map on any feature set" else ""`</div></div>
+<div class="tile"><div class="num">`r ct_spec$better` of `r n_children`</div>
+<div class="lbl">children recognised better on the spectral features</div>
+<div class="sub">worse for `r ct_spec$worse`; checked on fresh seeds, child by child</div></div>
+<div class="tile"><div class="num">`r length(sets_ho)` of 5</div>
+<div class="lbl">feature sets with a gain beyond the seed noise on held-out children</div>
+<div class="sub">95% intervals exclude zero`r if (length(level_ho)) paste0("; ", and_list(SETS[level_ho]), " level") else ""`</div></div>
+</div>
+
+```{r headline, echo = FALSE}
+S2 <- S[n == 27 & method %in% c(CLASSIC, ROBUST) & measure %in% c("heldout_super_acc", "accuracy")]
+S2[, who := ifelse(method == CLASSIC, "classic", "robust")][, protocol := as.character(measure)]
+p_dumbbell(as.data.frame(S2), c("heldout_super_acc", "accuracy"),
+           c(sprintf("Children never seen (%d seeds)", max(S2[protocol == "heldout_super_acc"]$seeds)),
+             sprintf("All 648 segments (%d seeds)", max(S2[protocol == "accuracy"]$seeds))))
+```
+
+<p class="note">Each dot is a mean over seeds; hover for the spread. The number beside each pair is the gain in
+percentage points. The buttons switch between children the map has never seen and the article's own
+accuracy on all 648 segments.</p>
+
+What changes in the code is one call:
+
+```{.r .fold-show}
+# the article (Patrikei et al. 2026, functions/functions_df_total_cv.R)
+kohonen::som(X, grid = kohonen::somgrid(5, 5, "hexagonal"), rlen = 1000, alpha = c(0.05, 0.01),
+             dist.fcts = "sumofsquares", init = aweSOM::somInit(X, 5, 5, "random"), maxNA.fraction = 8)
+# this report: the novel_SOM core with an L1 winner and a clipped pull, on the same schedule
+fit_som(X, "l1_huber:article", seed)          # R/som_fits.R
+```
+
+# 1. What is compared
+
+## The article's pipeline
+
+1. **Data.** 81 children, eight segments each recorded with a back-mounted IMU (Cuberek et al., 2024): a 4x10 m
+   shuttle run, crawling, a progressive cone shuffle run, a ring collection and placement run, a 10x position
+   change drill, 10x gymnastic hoops passing, 10x bench jumping, and crawling again. Seven tasks, 648 segments.
+2. **Features.** Five feature sets (RQA; autocorrelation; spectral; Mix, which is the three together; all tsfresh
+   features), each reduced to its top 27 features by XGBoost gain and standardised.
+3. **Map.** A 5&times;5 hexagonal SOM, `kohonen::som`, online, 1000 passes, learning rate 0.05 to 0.01.
+4. **Clusters and accuracy.** The 25 prototypes are cut into 7 super-clusters by PAM; each super-cluster is named
+   after the task most of its segments belong to, and the accuracy is the share of segments whose super-cluster
+   carries their task.
+
+## The robust SOM
+
+The classical online SOM picks the unit nearest to a segment $\mathbf{x}$ in Euclidean distance and pulls the
+winner and its lattice neighbours toward $\mathbf{x}$. The robust SOM changes two things and nothing else:
+
+$$c(\mathbf{x}) = \arg\min_k \sum_{i=1}^{27} \lvert x_i - m_{k,i} \rvert$$
+
+$$\mathbf{m}_j \leftarrow \mathbf{m}_j + \alpha(t)\, h_{c j}(t)\, \operatorname{clip}\!\left(\mathbf{x} - \mathbf{m}_j,\, -1,\, 1\right)$$
+
+* **The winner** is chosen by the Manhattan (L1) distance, which a single extreme feature cannot dominate.
+* **The pull** is clipped at one standard deviation in every feature, so an outlying segment moves a prototype
+  no further than a typical one.
+* **Everything else is the article's:** the bubble neighbourhood $h_{cj}(t) = 1$ when the lattice distance between
+  units $c$ and $j$ is at most the radius $r(t)$; $\alpha$ from 0.05 to 0.01 and $r$ from 3 to 0 over 1000
+  passes; the start, 25 randomly drawn segments. The super-clusters are PAM on the L1 distances between the
+  prototypes.
+
+The variant comes from [novel_SOM](https://github.com/andrii-patrikei/novel_SOM), a compiled SOM core with
+seventeen variants: nine distances, six with a training ingredient (a clipped pull, a conscience, annealing or
+momentum) and two lattices (a rectangular sheet and a torus). Its code is vendored in `novel_som/`, with one
+addition: the bubble neighbourhood of kohonen, which lets any variant run on the article's schedule.
+
+## How it is judged
+
+| | Held fixed (the article's) | Changed |
+|---|---|---|
+| Data | the article's feature matrices, read from its saved models | |
+| Map | 5&times;5 units, 1000 passes, learning rate 0.05 to 0.01 | the SOM algorithm |
+| Clusters | 7 super-clusters by PAM, each named after its majority task | PAM uses the map's own distance |
+| Measures | accuracy, QE, explained variance, topographic and Kaski-Lagus error, the article's k-fold | plus children held out |
+| Seeds | | `r n_all` seeds per map instead of one |
+
+Three protocols, all with 27 features:
+
+* **All data**, the article's Table 4: one map on all 648 segments (`r n_all` seeds).
+* **Held-out children**: 9 folds of 9 children; the map, its super-clusters and their names come from 72
+  children, and the segments of the other 9 are predicted (`r n_cv` seeds). This is the honest test of recognising
+  movement in a new child.
+* **Confirmation**: the screening winner against the classical SOM again, on `r n_conf` fresh seeds (new starts, new
+  orders of segments, new folds of children), with every prediction kept for a child-by-child comparison.
+
+# 2. The article, reproduced
+
+The ports of the article's measures (`R/article_metrics.R`, without caret) recompute every number saved with the
+article's 170 maps (2 to 35 features, five feature sets):
+
+```{r reproduce, echo = FALSE}
+chk <- rbindlist(lapply(2:35, function(n) rbindlist(lapply(seq_along(SETS), function(k) {
+  s <- D$models[[n]]$som[[names(SETS)[k]]]$SOM_results$som_model
+  q <- as.data.frame(D$models[[n]]$quality[[1]])[k, ]
+  a <- article_accuracy(s$unit.classif, cluster::pam(s$codes[[1]], 7)$clustering, D$y7)
+  sq <- som_quality(s$data[[1]], s$codes[[1]], kohonen::unit.distances(s$grid))
+  data.table(Accuracy = a$accuracy - q[["Accuracy rate all"]], mnLogLoss = a$mnLogLoss - unname(q[["mnLogLoss all"]]),
+             `Quantization error` = sq$QE - q[["Quantization error"]], `Explained variance` = sq$EV - q[["(% explained variance)"]],
+             `Topographic error` = sq$TE - q[["Topographic error"]], `Kaski-Lagus error` = sq$KL - q[["Kaski-Lagus error"]])
+}))))
+knitr::kable(data.frame(Measure = names(chk), `Largest difference over the 170 saved maps` = signif(sapply(chk, function(v) max(abs(v))), 2),
+                        check.names = FALSE), row.names = FALSE)
+pub <- D$models[[27]]$som$tsfresh$SOM_results$som_model
+re <- fit_kohonen(D$X$tsfresh[["27"]], 1245)
+same <- rbindlist(lapply(1:10, function(s) {
+  k <- fit_kohonen(D$X$tsfresh[["27"]], s); e <- fit_novel(D$X$tsfresh[["27"]], "euclid", s, regime = "article")
+  data.table(seed = s, identical = max(abs(k$M - e$M)) == 0)
+}))
+```
+
+The article's published map also comes back bit for bit: `set.seed(1245)` and its own `kohonen::som` call give
+the published codebook again (largest difference `r max(abs(re$M - pub$codes[[1]]))`). And the novel_SOM core on
+the article's schedule *is* kohonen's algorithm: with the same seed it draws the same start and the same order of
+segments and returns an identical codebook in `r sum(same$identical)` of 10 seeds. In the others the two runs part
+at the first near tie in the winner search, which kohonen settles with an extra random draw (distances within a
+relative 10<sup>-8</sup>) and novel_SOM by taking the first unit; from there on they are two equally valid runs of
+the same algorithm. A single run is therefore partly luck, and every map below is trained with `r n_all` seeds.
+
+# 3. Screening 34 SOMs
+
+Every novel_SOM variant was trained twice: with its own schedule (Gaussian neighbourhood, learning rate 0.5 to
+0.01, 10 passes) and with the article's. Pick a measure; rows are sorted by the held-out accuracy (empty cells:
+not judged on held-out children). "&middot; article's" marks the article's schedule, "&middot; own" novel_SOM's own.
+
+```{r leaderboard, echo = FALSE}
+sched <- function(m) ifelse(m == "kohonen", "", ifelse(grepl(":article$", m), " (article's schedule)", " (own schedule)"))
+lab_of <- function(m) ifelse(m == CLASSIC, "Classical SOM, kohonen::som (the article)",
+                             ifelse(m == ROBUST, "Robust SOM: Manhattan winner, clipped pull (article's schedule)", paste0(method_parts(m)$label, sched(m))))
+meas <- c(heldout_super_acc = "Held-out children, the article's super-cluster rule", heldout_unit_acc = "Held-out children, each unit names its task",
+          accuracy = "All 648 segments, the article's accuracy", kfold_test = "The article's k-fold test", TE = "Topographic error (lower is better)")
+ordr <- overall[order(-heldout_super_acc, -accuracy)]$method
+mats <- lapply(names(meas), function(me) {
+  x <- dcast(S[n == 27 & measure == me], method ~ set, value.var = "mean")
+  m <- as.matrix(x[match(ordr, method), names(SETS), with = FALSE]); cbind(m, `Mean of the five` = rowMeans(m))
+})
+short_of <- function(m) ifelse(m == CLASSIC, "Classical SOM (the article)", ifelse(m == ROBUST, "Robust SOM (L1 winner, clipped pull)",
+                               paste0(method_parts(m)$label, ifelse(grepl(":article$", m), " \u00b7 article's", " \u00b7 own"))))
+p_leaderboard(mats, short_of(ordr), c("RQA", "Autocorr.", "Spectral", "Mix", "tsfresh", "Mean"), unname(meas), names(meas) == "TE",
+              bold = match(c(CLASSIC, ROBUST), ordr))
+```
+
+<div class="callout">
+
+* **On its own schedule, novel_SOM gains little.** Its maps are better ordered (topographic error
+  `r sprintf("%.2f", ow$TE)` for its best variant, against `r sprintf("%.2f", kh$TE)`), but that variant (`r ow$label`)
+  reaches `r f3(ow$heldout_super_acc)` on held-out children against `r f3(kh$heldout_super_acc)` for the classical SOM
+  (`r pts(ow$heldout_super_acc - kh$heldout_super_acc)` points).
+* **On the article's schedule, the robust variants lead.** The Euclidean variant on this schedule matches the
+  classical SOM (held-out `r f3(overall[method == "euclid:article"]$heldout_super_acc)` against `r f3(kh$heldout_super_acc)`), as
+  it should, since it is the same algorithm. What lifts the accuracy is robustness: an L1 winner, a clipped pull,
+  a conscience against units that collect the extreme segments.
+* **The winner by the rule fixed in advance** (best held-out accuracy over the five feature sets, among the
+  variants whose distance means something on a feature vector) is the **Manhattan winner with the clipped
+  pull**: `r f3(rb$heldout_super_acc)` on held-out children.
+* The elastic distances (DTW, soft-DTW, shape-based) align a series in time, and a feature vector has no time
+  axis: on all data the DTW family reaches at most `r f3(max(overall[method %in% c("dtw:article", "dtw:novel", "softdtw:novel", "dtw_anneal:article", "dtw_anneal:novel")]$accuracy))`
+  and the shape-based distance `r f3(max(overall[method %in% c("sbd:article", "sbd:novel")]$accuracy))`, against
+  `r f3(kh$accuracy)` for the classical SOM.
+
+</div>
+
+<details><summary>All 34 maps in a table (sortable, searchable, downloadable)</summary>
+
+```{r leaderboard-table, echo = FALSE}
+lt <- overall[match(ordr, method), .(Map = lab_of(method), Schedule = c(kohonen = "the article's (kohonen)", article = "the article's", novel = "novel_SOM's own")[regime],
+                                     `Elastic distance` = ifelse(elastic, "yes", ""), `Held-out, super-clusters` = heldout_super_acc,
+                                     `Held-out, unit majority` = heldout_unit_acc, `All data (article)` = accuracy, `Article's k-fold test` = kfold_test,
+                                     `Topographic error` = TE)]
+ho_sets <- dcast(S[n == 27 & measure == "heldout_super_acc"], method ~ set, value.var = "mean")
+lt <- cbind(lt, ho_sets[match(ordr, method), names(SETS), with = FALSE]); setnames(lt, names(SETS), paste("Held-out,", SETS))
+dt_table(lt, round_cols = names(lt)[4:ncol(lt)], page = 12)
+```
+
+</details>
+
+# 4. The robust SOM against the classical SOM
+
+## Seed by seed
+
+```{r seeds, echo = FALSE}
+Rs <- melt(R[n == 27 & method %in% c(CLASSIC, ROBUST)], id.vars = c("set", "method", "seed"),
+           measure.vars = c("heldout_super_acc", "accuracy"), variable.name = "protocol")[!is.na(value)]
+Rs[, who := ifelse(method == CLASSIC, "classic", "robust")][, set_label := factor(SETS[set], levels = SETS)][, protocol := as.character(protocol)]
+p_seed_boxes(as.data.frame(Rs), as.data.frame(pubs[n == 27, .(set_label, value = accuracy)]), c("heldout_super_acc", "accuracy"),
+             c(sprintf("Children never seen (%d seeds)", n_cv), sprintf("All 648 segments (%d seeds)", n_all)))
+```
+
+<p class="note">Every dot is one seed. The black diamonds (all-data view) are the article's published maps:
+one seed each, which is why they can sit anywhere in the classical SOM's spread.</p>
+
+## Beyond the seed noise
+
+```{r forest, echo = FALSE}
+dd2 <- DD[measure %in% c("heldout_super_acc", "accuracy")]
+lv <- c(sprintf("children the map has never seen (%d seeds)", n_cv), sprintf("all 648 segments (%d seeds)", n_all))
+dd2[, protocol_label := factor(ifelse(measure == "accuracy", lv[2], lv[1]), levels = lv)]
+p_forest(as.data.frame(dd2))
+```
+
+```{r forest-table, echo = FALSE}
+ft <- dcast(DD[measure %in% c("heldout_super_acc", "accuracy", "heldout_unit_acc")], set_label ~ measure,
+            value.var = c("classic", "robust", "diff", "lo", "hi"))
+cell <- function(me) sprintf("%s to %s (%s, %s to %s)", f3(ft[[paste0("classic_", me)]]), f3(ft[[paste0("robust_", me)]]),
+                            pts(ft[[paste0("diff_", me)]]), pts(ft[[paste0("lo_", me)]]), pts(ft[[paste0("hi_", me)]]))
+knitr::kable(data.frame(`Feature set` = ft$set_label, `Held-out children, super-clusters` = cell("heldout_super_acc"),
+                        `Held-out children, unit majority` = cell("heldout_unit_acc"), `All 648 segments` = cell("accuracy"), check.names = FALSE),
+             caption = "Classical to robust SOM (gain in points, 95% Welch interval over the seeds)")
+```
+
+On held-out children the intervals exclude zero on **`r and_list(SETS[sets_ho])`**; on all 648 segments on
+**`r and_list(SETS[sets_all])`**. `r if (length(level_ho)) paste0("On ", and_list(SETS[level_ho]), " the gain is within the seed noise", if ("rqa" %in% level_ho) " (RQA is the weakest feature set for every map)" else "", ". ") else ""`The
+intervals describe the variation between training runs on the same 81 children; the child-by-child comparison
+below tests the children themselves.
+
+## Child by child, on fresh seeds
+
+The screening chose the robust SOM on seeds 1 to `r n_all`. To make sure that choice did not ride on lucky seeds,
+the robust and the classical SOM were run again on `r n_conf` new seeds (`r conf_seeds[1]` to `r conf_seeds[2]`: new starts,
+new orders of segments, new folds of children), keeping the prediction for every segment. Each child then has an
+accuracy under each map, averaged over the `r n_conf` runs and its 8 segments.
+
+```{r children, echo = FALSE}
+p_children(as.data.frame(PC), first = SETS[["spectr"]])
+```
+
+```{r children-table, echo = FALSE}
+ct <- CT[order(rule, set_label)]
+knitr::kable(data.frame(`Rule` = ifelse(ct$rule == "super", "super-clusters (the article's)", "unit majority"), `Feature set` = ct$set_label,
+                        `Children better / worse / equal` = sprintf("%d / %d / %d", ct$better, ct$worse, ct$equal),
+                        `Mean gain per child (points)` = sprintf("%s (%s to %s)", pts(ct$mean_gain), pts(ct$lo), pts(ct$hi)),
+                        `Wilcoxon p (Holm)` = ifelse(ct$p_holm < 1e-4, "< 0.0001", sprintf("%.4f", ct$p_holm)), check.names = FALSE),
+             caption = sprintf("Held-out children on %d fresh seeds: the gain of each of the %d children (mean, bootstrap 95%% interval over children; paired Wilcoxon signed-rank test, Holm-adjusted over the five feature sets)", n_conf, n_children))
+```
+
+With fresh seeds the held-out accuracy averaged over the five feature sets is `r f3(rep_acc[method == CLASSIC, mean(super)])`
+for the classical and `r f3(rep_acc[method == ROBUST, mean(super)])` for the robust SOM (`r f3(kh$heldout_super_acc)` and
+`r f3(rb$heldout_super_acc)` in the screening), so the gain replicates. On the spectral features
+`r ct_spec$better` of the `r n_children` children are recognised better and `r ct_spec$worse` worse; on tsfresh, where the
+classical map already gets most children right, `r ct_ts$better` better and `r ct_ts$worse` worse.
+
+## Robustness checks
+
+```{r checks, echo = FALSE}
+chk2 <- rbind(
+  data.table(Check = "Accuracy, all data (the map's own distance)", Classical = per_set("accuracy", CLASSIC), Robust = per_set("accuracy", ROBUST), set = names(SETS)),
+  data.table(Check = "Accuracy, all data, codebook clustered the article's way (Euclidean winners, PAM)", Classical = per_set("accuracy_euclid", CLASSIC),
+             Robust = per_set("accuracy_euclid", ROBUST), set = names(SETS)),
+  data.table(Check = "Balanced accuracy, held-out children (every task counts the same)", Classical = per_set("heldout_super_bacc", CLASSIC),
+             Robust = per_set("heldout_super_bacc", ROBUST), set = names(SETS)),
+  data.table(Check = "Topographic error, all data (lower is better)", Classical = per_set("TE", CLASSIC), Robust = per_set("TE", ROBUST), set = names(SETS)))
+chk2 <- dcast(chk2, Check ~ set, value.var = c("Classical", "Robust"))
+out <- data.frame(Check = chk2$Check)
+for (s in names(SETS)) out[[SETS[[s]]]] <- sprintf("%s to %s", f3(chk2[[paste0("Classical_", s)]]), f3(chk2[[paste0("Robust_", s)]]))
+knitr::kable(out[match(c("Accuracy, all data (the map's own distance)", "Accuracy, all data, codebook clustered the article's way (Euclidean winners, PAM)",
+                         "Balanced accuracy, held-out children (every task counts the same)", "Topographic error, all data (lower is better)"), out$Check), ],
+             row.names = FALSE, caption = "Classical to robust SOM, means over the seeds")
+```
+
+* **The gain is in the map, not only in the clustering step.** Read the article's way (Euclidean winners, PAM on
+  the Euclidean distances between prototypes), the robust codebook still beats the classical SOM on
+  `r sum(eu_rb > eu_cl)` of 5 feature sets (mean `r f3(mean(eu_rb))` against `r f3(mean(eu_cl))`; with its own L1 reading
+  `r f3(mean(per_set("accuracy", ROBUST)))`).
+* **It is not an artefact of class sizes.** Crawling has twice as many segments as the other tasks; the balanced
+  accuracy, which weighs every task equally, rises from `r f3(mean(per_set("heldout_super_bacc", CLASSIC)))` to
+  `r f3(mean(per_set("heldout_super_bacc", ROBUST)))` on held-out children (mean of the five feature sets).
+* **The map stays a map.** Its topographic error averages `r sprintf("%.2f", mean(per_set("TE", ROBUST)))`, against
+  `r sprintf("%.2f", mean(per_set("TE", CLASSIC)))` for the classical SOM, so the lattice is `r if (mean(per_set("TE", ROBUST)) <= mean(per_set("TE", CLASSIC))) "at least as well ordered" else "about as well ordered"`.
+
+## The article's Table 4
+
+Every measure of the article's Table 4, for every map and feature set (means over the seeds; the article's
+published map, one seed, for comparison). Filter by feature set or map, sort any column.
+
+```{r table4, echo = FALSE}
+w <- dcast(S[n == 27], set + method ~ measure, value.var = c("mean", "sd"))
+t4 <- w[, .(`Feature set` = SETS[set], Map = lab_of(method), `QE` = mean_QE, `EV %` = mean_EV, TE = mean_TE, KL = mean_KL,
+            Accuracy = mean_accuracy, `Accuracy sd` = sd_accuracy, mnLogLoss = mean_mnLogLoss, `k-fold train` = mean_kfold_train,
+            `k-fold test` = mean_kfold_test, `Held-out, super-clusters` = mean_heldout_super_acc, `Held-out, units` = mean_heldout_unit_acc)]
+p27 <- pubs[n == 27, .(`Feature set` = SETS[set], Map = "The article's published map (seed 1245)", QE, `EV %` = EV, TE, KL, Accuracy = accuracy,
+                       `Accuracy sd` = NA_real_, mnLogLoss, `k-fold train` = kfold_train, `k-fold test` = kfold_test,
+                       `Held-out, super-clusters` = NA_real_, `Held-out, units` = NA_real_)]
+t4 <- rbind(p27, t4)[order(match(`Feature set`, SETS), -Accuracy)]
+t4[, `Feature set` := factor(`Feature set`, levels = SETS)]
+dt_table(t4, round_cols = names(t4)[3:ncol(t4)], page = 10, filter = "top")
+```
+
+<p class="note">QE, EV, TE and KL are the Euclidean measures of <code>aweSOM::somQuality</code>, as in the article.
+The article's k-fold "test" trains a new map on the test quarter and scores it on that same quarter, so it is not a
+prediction for unseen data; the held-out columns are.</p>
+
+# 5. Why it works: the features have outliers
+
+The variants that win are the robust ones, which points at outliers. The article's features are standardised
+but heavy-tailed: a few segments sit far out on a few features, and the squared Euclidean pull lets them drag
+prototypes away from the bulk of their task.
+
+```{r tails, echo = FALSE}
+tails <- rbindlist(lapply(names(SETS), function(k) {
+  X <- D$X[[k]][["27"]]; kurt <- apply(X, 2, function(v) mean(v^4) / mean(v^2)^2)
+  data.table(`Feature set` = SETS[[k]], `Segments with a feature beyond 3 sd` = sprintf("%.0f%%", 100 * mean(apply(abs(X) > 3, 1, any))),
+             `Largest value (sd)` = sprintf("%.1f", max(abs(X))), `Median kurtosis (Gaussian: 3)` = sprintf("%.1f", median(kurt)),
+             `Gain on held-out children` = pts(per_set("heldout_super_acc", ROBUST)[[k]] - per_set("heldout_super_acc", CLASSIC)[[k]]))
+}))
+knitr::kable(tails, caption = "The 27-feature matrices of the article")
+```
+
+A direct test: clip every feature at &plusmn;3 standard deviations (winsorise) and train both maps again. If the
+gain is robustness, the classical SOM on clipped features should catch up most of the way, and the robust SOM
+should barely change.
+
+```{r winsor, echo = FALSE}
+Dw <- D; Dw$models <- NULL
+Dw$X <- lapply(D$X, function(s) list(`27` = pmin(pmax(s[["27"]], -3), 3)))
+wjobs <- rbind(make_jobs(names(SETS), 27, c(CLASSIC, ROBUST), if (params$quick) 1:2 else 1:20, "all"),
+               make_jobs(names(SETS), 27, c(CLASSIC, ROBUST), if (params$quick) 1:2 else 1:10, "heldout"))
+W <- cached("somvar_winsor3", bench_key(wjobs[, c("set", "n", "method", "seed", "protocols")], 10, D$md5, "features clipped at 3 sd"),
+            function() run_jobs(wjobs, Dw, 10, cores), res_dir)
+wsum <- function(x, col) x[!is.na(get(col)), .(v = mean(get(col))), by = .(set, method)]
+wt <- rbind(cbind(wsum(R[n == 27 & method %in% c(CLASSIC, ROBUST)], "heldout_super_acc"), data = "as the article used them"),
+            cbind(wsum(W, "heldout_super_acc"), data = "clipped at 3 sd"))
+wt[, col := paste0(ifelse(method == CLASSIC, "Classical SOM", "Robust SOM"), ", features ", data)]
+wt <- dcast(wt, set ~ col, value.var = "v")
+wt <- rbind(wt[match(names(SETS), set)], wt[, c(list(set = "mean"), lapply(.SD, mean)), .SDcols = !"set"])
+wt[, set := ifelse(set == "mean", "**Mean of the five**", SETS[set])]
+setnames(wt, "set", "Feature set")
+w_mean <- function(m) W[method == m & !is.na(heldout_super_acc), .(v = mean(heldout_super_acc)), by = set][, mean(v)]
+knitr::kable(wt, digits = 3, caption = sprintf("Accuracy on held-out children with the features as the article used them and clipped at 3 sd (%d seeds)", W[method == CLASSIC & !is.na(heldout_super_acc), uniqueN(seed)]))
+```
+
+Clipping lifts the classical SOM from `r f3(kh$heldout_super_acc)` to `r f3(w_mean(CLASSIC))` on held-out children
+(mean of the five feature sets), while the robust SOM moves from `r f3(rb$heldout_super_acc)` to `r f3(w_mean(ROBUST))`.
+Most of the gain is robustness to outliers, which the robust SOM gets without touching the data or choosing a
+threshold`r if (rb$heldout_super_acc > w_mean(CLASSIC)) ", and it stays the more accurate map" else ""`.
+
+# 6. The number of features: Table 5 and beyond
+
+The article compared 24 to 27 features and chose 27. Its saved maps cover 2 to 35 features, one seed each.
+
+```{r curve, echo = FALSE}
+C <- res$curve[method %in% c(CLASSIC, ROBUST, "euclid:novel"), .(mean = mean(accuracy), min = min(accuracy), max = max(accuracy)), by = .(set, n, method)]
+C[, who := ifelse(method == CLASSIC, "classic", ifelse(method == ROBUST, "robust", "own"))]
+C[, set_label := factor(SETS[set], levels = SETS)]
+nseeds_curve <- res$curve[method == CLASSIC, uniqueN(seed)]
+p_curve(as.data.frame(C), as.data.frame(pubs), c(classic = COL_CLASSIC, robust = COL_ROBUST, own = COL_OWN),
+        c(classic = sprintf("Classical SOM, %d seeds", nseeds_curve), robust = sprintf("Robust SOM, %d seeds", nseeds_curve),
+          own = sprintf("Online SOM on novel_SOM's own schedule, %d seeds", nseeds_curve)), first = SETS[["tsfresh"]])
+rng <- res$curve[method == CLASSIC, .(lo = min(accuracy), hi = max(accuracy)), by = .(set, n)]
+inside <- merge(rng, pubs[, .(set, n, accuracy)], by = c("set", "n"))[, mean(accuracy >= lo & accuracy <= hi)]
+ahead <- merge(res$curve[method == ROBUST, .(r = mean(accuracy)), by = .(set, n)], res$curve[method == CLASSIC, .(k = mean(accuracy)), by = .(set, n)],
+               by = c("set", "n"))[n >= 10]
+```
+
+<p class="note">Lines are means over the seeds, bands the range of the seeds; the black line is the article's
+published maps. The buttons switch the feature set.</p>
+
+`r sprintf("%.0f%%", 100 * inside)` of the article's published accuracies lie inside the range of
+`r nseeds_curve` seeds of the same classical SOM`r if (inside >= 0.6) ", so the jumps of the published curve from one number of features to the next are mostly the luck of one seed" else ""`.
+The robust SOM is ahead of the classical one at
+`r sum(ahead$r > ahead$k)` of `r nrow(ahead)` combinations of feature set and 10 to 35 features.
+
+```{r table5, echo = FALSE}
+t5 <- res$curve[n %in% 24:27 & method %in% c(CLASSIC, ROBUST), .(v = sprintf("%.3f &plusmn; %.3f", mean(accuracy), sd(accuracy))), by = .(set, n, method)]
+if (nrow(t5)) {
+  t5 <- dcast(t5, set + n ~ method, value.var = "v")
+  t5 <- merge(t5, pubs[n %in% 24:27, .(set, n, published = sprintf("%.3f", accuracy))], by = c("set", "n"))
+  t5 <- t5[order(match(set, names(SETS)), n), .(`Feature set` = SETS[set], Features = n, `The article (one seed)` = published,
+                                                  `Classical SOM` = get(CLASSIC), `Robust SOM` = get(ROBUST))]
+  knitr::kable(t5, caption = sprintf("The article's Table 5: accuracy on all data, 24 to 27 features (mean &plusmn; sd over %d seeds)", nseeds_curve))
+}
+```
+
+# 7. The maps
+
+The article's Fig. 3, redrawn: each unit a pie of the tasks it wins (area by the number of segments), thick lines
+between the 7 super-clusters. The classical and the robust SOM are shown at their median seed, a representative
+run rather than the best one. Hover a unit for its segments.
+
+```{r map-fits, echo = FALSE}
+median_seed <- function(st, m) { x <- R[set == st & n == 27 & method == m]; x$seed[which.min(abs(x$accuracy - median(x$accuracy)))] }
+build_maps <- function(st) {
+  X <- D$X[[st]][["27"]]; p <- D$models[[27]]$som[[st]]$SOM_results$som_model
+  mk <- median_seed(st, CLASSIC); mb <- median_seed(st, ROBUST)
+  out <- list(list(title = "The article, published (seed 1245)", fit = list(M = p$codes[[1]], bmu = p$unit.classif, euclid_family = TRUE), pos = p$grid$pts),
+              list(title = sprintf("Classical SOM, median seed (%d)", mk), fit = fit_kohonen(X, mk), pos = kohonen::somgrid(5, 5, "hexagonal")$pts),
+              list(title = sprintf("Robust SOM, median seed (%d)", mb), fit = fit_som(X, ROBUST, mb), pos = make_grid(5, 5)$pos))
+  lapply(out, function(m) { m$super <- super_clusters(m$fit); m$bmu <- m$fit$bmu; m$acc <- article_accuracy(m$bmu, m$super, D$y7)
+    m$subtitle <- sprintf("accuracy %.3f", m$acc$accuracy); m$square <- FALSE; m })
+}
+maps_ts <- build_maps("tsfresh"); maps_sp <- build_maps("spectr")
+```
+
+## Spectral and tsfresh features {.tabset .tabset-pills}
+
+### Spectral features
+
+```{r maps-spectral, echo = FALSE}
+p_maps(maps_sp, D$y7)
+```
+
+### tsfresh features (the article's figure)
+
+```{r maps-tsfresh, echo = FALSE}
+p_maps(maps_ts, D$y7)
+```
+
+<details><summary>The article's Table 6: segments per super-cluster and task, tsfresh maps</summary>
+
+```{r table6, echo = FALSE, results = "asis"}
+for (m in maps_ts) {
+  tab <- unclass(m$acc$table); colnames(tab) <- TASKS7
+  d6 <- data.frame(`Super-cluster` = seq_len(nrow(tab)), `Named after` = TASKS7[m$acc$task], tab, Total = rowSums(tab),
+                   Purity = sprintf("%.2f", apply(tab, 1, max) / pmax(rowSums(tab), 1)), check.names = FALSE)
+  cat("\n\n**", m$title, "**, accuracy ", f3(m$acc$accuracy), "\n\n", sep = ""); print(knitr::kable(d6, row.names = FALSE))
+}
+```
+
+</details>
+
+# 8. Conclusions
+
+<div class="callout">
+
+* **The robust SOM recognises children's movement tasks better than the classical SOM**, with the article's own
+  features, map size, clustering and measure. On children it has never seen, the mean accuracy over the five
+  feature sets rises from `r f3(kh$heldout_super_acc)` to `r f3(rb$heldout_super_acc)`, and the gain holds on fresh seeds
+  and child by child.
+* **The gain is largest where the classical map struggles**: spectral `r pts(per_set("heldout_super_acc", ROBUST)[["spectr"]] - per_set("heldout_super_acc", CLASSIC)[["spectr"]])`,
+  autocorrelation `r pts(per_set("heldout_super_acc", ROBUST)[["autocorr"]] - per_set("heldout_super_acc", CLASSIC)[["autocorr"]])`, Mix
+  `r pts(per_set("heldout_super_acc", ROBUST)[["mix"]] - per_set("heldout_super_acc", CLASSIC)[["mix"]])` points.`r if (spec_beats_all) paste0(" With the robust SOM the spectral features (", f3(ho_rb[["spectr"]]), ") do better than the classical SOM on any feature set, including the article's tsfresh choice (", f3(ho_cl[["tsfresh"]]), ").") else ""`
+* **Why:** the features are heavy-tailed, and an L1 winner with a clipped pull keeps outlying segments from
+  dragging prototypes. Clipping the features helps the classical SOM too (`r f3(w_mean(CLASSIC))` on held-out
+  children), `r if (w_mean(CLASSIC) < rb$heldout_super_acc) "but not as far as the robust SOM goes without clipping" else "about as far as the robust SOM goes"` (`r f3(rb$heldout_super_acc)`).
+* **Results from one seed are fragile.** The article's published `r f3(pubs[n == 27 & set == "tsfresh"]$accuracy)` (tsfresh) sits near
+  the top of its own spread: `r n_all` seeds of the same call give `r f3(S[n == 27 & set == "tsfresh" & method == CLASSIC & measure == "accuracy"]$mean)` on average, from
+  `r f3(S[n == 27 & set == "tsfresh" & method == CLASSIC & measure == "accuracy"]$min)` to
+  `r f3(S[n == 27 & set == "tsfresh" & method == CLASSIC & measure == "accuracy"]$max)`. Reporting the mean and spread over seeds,
+  on held-out children, makes a SOM study comparable.
+
+</div>
+
+**Limitations.**
+
+* The article chose the 27 features with XGBoost on all 81 children, so the held-out accuracies are optimistic
+  for every map. This affects both maps equally and leaves the comparison fair; a fully nested study would choose
+  the features inside every fold.
+* One data set, 81 children from one study. The child-level test generalises to children like these, not to
+  other sensors, ages or tasks.
+* On the article's best feature set (tsfresh) the gain is small (`r pts(d_ho[set == "tsfresh"]$diff)` points on
+  held-out children), and on RQA the robust SOM is level with the classical one. There the correlation distance
+  helps instead (all data `r f3(per_set("accuracy", "correlation:article")[["rqa"]])` against
+  `r f3(per_set("accuracy", CLASSIC)[["rqa"]])`), which suggests the scale of the RQA features is the problem.
+* The screening tried 34 maps; the confirmation on fresh seeds guards against a lucky choice, but not against a
+  data set that happens to favour robust maps.
+
+# 9. Reproduce
+
+```{.bash .fold-show}
+Rscript run_som_variants.R        # all maps, about 1.5 hours on 18 cores; results go to results/
+```
+
+Then knit `som_variants.Rmd` (a few minutes; `quick: true` in the YAML header knits a small version). The
+article's saved models (95 MB) are downloaded to `data/` from its repository on first use and checked by md5.
+
+| File | What it holds |
+|---|---|
+| `R/article_metrics.R` | the article's accuracy, mnLogLoss and quality measures, ported without caret |
+| `R/som_fits.R` | the article's `kohonen::som` call and the novel_SOM variants on both schedules |
+| `R/protocols.R` | all data, the article's k-fold, held-out children, per-segment predictions |
+| `R/bench.R` | the article's data, the plan, the parallel runs and the cache |
+| `R/plots.R`, `R/plots_interactive.R` | the static figures (README) and the interactive ones (this page) |
+| `novel_som/` | `ns_core.cpp` and `ns_maps.R` from novel_SOM (commit 2ae89c5), plus the bubble neighbourhood |
+| `results/` | the results of the latest run, so the report knits without retraining |
+
+Needs R 4.3 or later with Rcpp and a C++17 compiler (Rtools on Windows), and kohonen, aweSOM, cluster,
+data.table, ggplot2, plotly, DT, digest and patchwork.
+
+<details><summary>The analysis code of this page</summary>
+
+```{r ref.label = c("setup", "load", "analysis"), eval = FALSE, echo = TRUE}
+```
+
+</details>
+
+<details><summary>Session information</summary>
+
+```{r session, echo = FALSE}
+sessionInfo()
+```
+
+</details>
+
+```{r save-figures, include = FALSE, eval = params$save_figures && !params$quick}
+dir.create("figures", showWarnings = FALSE)
+ggsave("figures/som-variants-headline.png", dumbbell_plot(S2[protocol == "heldout_super_acc"],
+       title = "Accuracy on children the map has never seen, 27 features",
+       subtitle = sprintf("mean over %d seeds; the number is the gain of the robust SOM in percentage points", max(S2[protocol == "heldout_super_acc"]$seeds))),
+       width = 9, height = 4.6, dpi = 150, bg = "white")
+ggsave("figures/som-variants-children.png", children_plot(PC[set %in% c("spectr", "tsfresh")],
+       title = "Child by child: robust minus classical SOM, held-out accuracy",
+       subtitle = sprintf("each bar one of the %d children, mean over %d fresh seeds", n_children, n_conf)), width = 10, height = 4.2, dpi = 150, bg = "white")
+ggsave("figures/som-variants-curve.png", curve_plot(C[method %in% c(CLASSIC, ROBUST)], pubs,
+       setNames(c(COL[["kohonen"]], COL[["article"]]), c(CLASSIC, ROBUST)),
+       setNames(c(sprintf("Classical SOM (kohonen::som), %d seeds", nseeds_curve), sprintf("Robust SOM, %d seeds", nseeds_curve)), c(CLASSIC, ROBUST)),
+       title = "Accuracy against the number of features", subtitle = "lines: mean over the seeds; bands: range of the seeds; black: the article's published maps, one seed each"),
+       width = 11, height = 7, dpi = 150, bg = "white")
+spm <- lapply(maps_sp, function(m) hex_pie_map(m$pos, m$bmu, D$y7, m$super, title = m$title, subtitle = paste("Spectral features:", m$subtitle)))
+ggsave("figures/som-variants-maps-spectral.png", patchwork::wrap_plots(spm, nrow = 1, guides = "collect") & theme(legend.position = "bottom"),
+       width = 15, height = 6.5, dpi = 120, bg = "white")
+sm <- dcast(DD[measure %in% c("heldout_super_acc", "accuracy")], set_label ~ measure, value.var = c("classic", "robust", "diff"))
+sm_row <- function(lab, x) sprintf("| %s | %.3f | %.3f | **%+.1f** | %.3f | %.3f | %+.1f |", lab, x$classic_heldout_super_acc, x$robust_heldout_super_acc,
+                                   100 * x$diff_heldout_super_acc, x$classic_accuracy, x$robust_accuracy, 100 * x$diff_accuracy)
+sm_mean <- sm[, lapply(.SD, mean), .SDcols = !"set_label"]
+writeLines(c("| Feature set | Held-out children: classical SOM | robust SOM | gain (points) | All 648 segments: classical SOM | robust SOM | gain (points) |",
+             "|:--|--:|--:|--:|--:|--:|--:|", sapply(seq_len(nrow(sm)), function(i) sm_row(as.character(sm$set_label[i]), sm[i])),
+             sm_row("**Mean of the five**", sm_mean)), "figures/som_variants_summary.md")
+lt_md <- copy(lt)[, (4:ncol(lt)) := lapply(.SD, function(v) sprintf("%.3f", v)), .SDcols = 4:ncol(lt)]
+writeLines(c("# SOM variants on the article's features", "",
+             sprintf("%s: the article's feature matrices (27 features, top XGBoost gain), 5 x 5 maps, 7 PAM super-clusters; all data with %d seeds, held-out children (9 folds of 9 children) with %d seeds. Means over the five feature sets, then held-out accuracy per feature set.",
+                     format(Sys.Date()), n_all, n_cv), "", knitr::kable(lt_md, format = "pipe")), "figures/som_variants_table.md")
+```
