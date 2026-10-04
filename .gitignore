@@ -1,0 +1,13 @@
+data/
+*_cache/
+*_files/
+*.html
+!docs/*.html
+.Rhistory
+.RData
+.Rproj.user/
+__pycache__/
+results_quick/
+# a local copy of the article's repository (code.it4i.cz/ADAS/movement-classification): third-party code and
+# files of up to 191 MB, which GitHub refuses; the report downloads the one file it needs into data/
+movement-classification-main/

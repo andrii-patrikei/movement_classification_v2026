@@ -1,0 +1,1054 @@
+---
+title: "Movement tasks from a back-mounted IMU: alternatives to the XGBoost + SOM pipeline"
+subtitle: "Test harness for the Zenodo dataset 10.5281/zenodo.22647205"
+author: "Andrii Patrikei"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+    theme: flatly
+params:
+  data_dir: "data"            # where physical_exercise.csv lives / is downloaded to
+  download: true              # download from Zenodo if the CSV is missing
+  synthetic: false            # TRUE = fake recordings in the same CSV layout (pipeline smoke test)
+  quick: true                 # TRUE = subsample children, fewer epochs / kernels / rounds
+  n_children_quick: 24
+  k_folds: 5                  # 9 for the full protocol (9 folds x 9 children)
+  repeats: 1                  # 5 for the full protocol
+  fs: 100                     # sampling rate of the sensor
+  fs_low: 20                  # 4 s windows for DTW-SOM, MiniRocket, Mantis
+  fs_seg: 10                  # whole segments for the variable-length DTW-SOM and the maps
+  win_sec: 4                  # window length in seconds
+  overlap: 0.5                # window overlap
+  run_catch22: true           # needs Rcatch22
+  run_dtwsom: true            # DTW-SOM on 4 s windows (needs dtwsom)
+  run_dtwsom_segments: true   # DTW-SOM on whole variable-length segments (needs dtwsom)
+  run_minirocket: true        # needs reticulate + python: aeon, scikit-learn
+  run_mantis: false           # needs reticulate + python: mantis-tsfm, torch (downloads weights from Hugging Face)
+  run_twin_test: true         # 8-label model: are the two crawls confused?
+  run_maps: true              # section 7: SOM maps on all children
+  plot_channel: "acc_y"       # channel drawn in the DTW-SOM maps
+  som_xdim: 5
+  som_ydim: 5
+  use_cache: true             # reuse the feature matrix between knits (real data only)
+  python: ""                  # path to the python with aeon / mantis; "" = reticulate's default
+  save_figures: true          # real-data knits also write the PNGs and a results table to figures/ (used by the README)
+  seed: 42
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.width = 9, fig.height = 5)
+set.seed(params$seed)
+options(timeout = 3600)   # the CSV is 191 MB
+# real-data knits keep a copy of every figure in figures/<chunk-label>-1.png for the README;
+# synthetic runs don't, so fake plots never end up in the repository
+if (params$save_figures && !params$synthetic) knitr::opts_chunk$set(fig.path = "figures/")
+```
+
+# What this document does
+
+The Acta Gymnica article classified eight movement segments (seven tasks, crawling done twice)
+from 81 children using hand-crafted features, XGBoost gain for feature selection and a 5x5
+Self-Organizing Map. This document runs that idea again under a fixed, child-grouped evaluation
+protocol and puts alternatives next to it:
+
+| Route | Method | Package |
+|---|---|---|
+| Baseline | segment duration only | nnet |
+| C1 | RQA (chaosrcpp) + catch22 + basic stats, XGBoost | chaosrcpp, Rcatch22, xgboost |
+| C1 | same features, kohonen SOM, units and 7 super-clusters mapped to tasks | kohonen |
+| C2 | DTW-SOM on raw 4 s windows | dtwsom |
+| C2 | DTW-SOM on whole segments of different lengths | dtwsom |
+| A | MiniRocket + ridge classifier | aeon (Python) |
+| B | Mantis foundation model, frozen embeddings + random forest | mantis-tsfm (Python) |
+
+Every model is trained on the training children only and evaluated on held-out children.
+Window-level scores are averaged to one prediction per segment. Section 7 then draws the maps:
+DTW-SOM prototypes of different lengths with the segments mapped to them, and the feature SOM.
+
+Set `quick: false`, `k_folds: 9`, `repeats: 5` for the full protocol.
+`synthetic: true` generates fake recordings in the same long CSV layout, so the whole pipeline,
+including the loading and cleaning code, can be tested without the download. Use it first.
+A real-data knit also writes every figure and the results table to `figures/`, which the README shows.
+
+# 0. Packages and helpers
+
+```r
+install.packages(c("data.table", "xgboost", "kohonen", "nnet", "ggplot2", "MASS",
+                   "Rcatch22", "reticulate", "remotes"))
+remotes::install_github("andrii-patrikei/chaos-rcpp")
+remotes::install_github("andrii-patrikei/dtwsom")
+# Python side (the environment reticulate uses, or set params$python):
+#   pip install aeon scikit-learn            # MiniRocket
+#   pip install mantis-tsfm torch            # Mantis (optional)
+```
+
+```{r packages}
+has <- function(p) requireNamespace(p, quietly = TRUE)
+need <- c("data.table", "xgboost", "kohonen", "nnet", "ggplot2")
+missing <- need[!vapply(need, has, logical(1))]
+if (length(missing)) stop("Install first: ", paste(missing, collapse = ", "))
+
+library(data.table)
+library(ggplot2)
+
+have_chaos  <- has("chaosrcpp")
+have_dtwsom <- has("dtwsom")
+run_catch22 <- params$run_catch22 && has("Rcatch22")
+run_dtwsom     <- params$run_dtwsom && have_dtwsom
+run_dtwsom_seg <- params$run_dtwsom_segments && have_dtwsom
+run_maps       <- params$run_maps && have_dtwsom
+if (!have_chaos) message("chaosrcpp not installed: RQA features skipped. remotes::install_github('andrii-patrikei/chaos-rcpp')")
+if (params$run_catch22 && !run_catch22) message("Rcatch22 not installed: catch22 features skipped. install.packages('Rcatch22')")
+if (!have_dtwsom) message("dtwsom not installed: DTW-SOM routes and maps skipped. remotes::install_github('andrii-patrikei/dtwsom')")
+
+n_cores <- max(1L, parallel::detectCores() - 1L)
+cat("cores used:", n_cores, "\n")
+```
+
+```{r python-setup}
+run_py <- (params$run_minirocket || params$run_mantis) && has("reticulate")
+have_aeon <- have_mantis <- FALSE
+if (run_py) {
+  library(reticulate)
+  if (nzchar(params$python)) use_python(params$python, required = TRUE)
+  run_py <- tryCatch(py_available(initialize = TRUE), error = function(e) FALSE)
+  if (run_py) {
+    cat("python:", py_config()$python, "\n")
+    have_aeon   <- py_module_available("aeon") && py_module_available("sklearn")
+    have_mantis <- py_module_available("mantis") && py_module_available("torch")
+  }
+}
+run_minirocket <- params$run_minirocket && run_py && have_aeon
+run_mantis     <- params$run_mantis && run_py && have_mantis
+
+# what will run (anything unexpectedly "off": see the install block above, or set params$python)
+status <- c("RQA features (chaosrcpp)" = have_chaos, "catch22 features" = run_catch22,
+            "DTW-SOM, windows" = run_dtwsom, "DTW-SOM, segments" = run_dtwsom_seg,
+            "MiniRocket (aeon)" = run_minirocket, "Mantis" = run_mantis, "SOM maps (section 7)" = run_maps)
+wanted <- c(TRUE, params$run_catch22, params$run_dtwsom, params$run_dtwsom_segments,
+            params$run_minirocket, params$run_mantis, params$run_maps)
+cat(sprintf("%-26s %s\n", names(status), ifelse(status, "on", ifelse(wanted, "OFF (not installed)", "off"))), sep = "")
+```
+
+```{r helpers}
+# ---- evaluation ------------------------------------------------------------
+make_folds <- function(children, k, repeats, seed) {
+  set.seed(seed)
+  out <- list()
+  for (r in seq_len(repeats)) {
+    sh <- sample(children)
+    fold_of <- rep(seq_len(k), length.out = length(sh))
+    for (f in seq_len(k)) out[[length(out) + 1L]] <- list(rep = r, fold = f, test = sh[fold_of == f])
+  }
+  out
+}
+
+metrics <- function(truth, pred, classes) {
+  truth <- factor(truth, classes); pred <- factor(pred, classes)
+  cm <- table(truth, pred)
+  present <- rowSums(cm) > 0
+  recall <- diag(cm) / pmax(rowSums(cm), 1)
+  precision <- diag(cm) / pmax(colSums(cm), 1)
+  f1 <- ifelse(precision + recall > 0, 2 * precision * recall / (precision + recall), 0)
+  c(accuracy = mean(truth == pred),
+    balanced_accuracy = mean(recall[present]),
+    macro_f1 = mean(f1[present]))
+}
+
+ari <- function(a, b) {                       # adjusted Rand index, no extra package
+  tab <- table(a, b); comb2 <- function(x) x * (x - 1) / 2
+  sum_ij <- sum(comb2(tab)); sum_a <- sum(comb2(rowSums(tab))); sum_b <- sum(comb2(colSums(tab)))
+  expected <- sum_a * sum_b / comb2(sum(tab)); max_index <- (sum_a + sum_b) / 2
+  if (max_index == expected) return(1)
+  (sum_ij - expected) / (max_index - expected)
+}
+
+# average window scores per segment, return one predicted class per segment
+aggregate_scores <- function(scores, seg_ids, classes) {
+  scores <- as.matrix(scores)
+  miss <- setdiff(classes, colnames(scores))  # a class absent from a training fold
+  if (length(miss)) scores <- cbind(scores, matrix(min(scores, na.rm = TRUE) - 1, nrow(scores), length(miss),
+                                                   dimnames = list(NULL, miss)))
+  agg <- rowsum(scores[, classes, drop = FALSE], seg_ids)
+  data.frame(seg_id = rownames(agg), pred = classes[max.col(agg, ties.method = "first")],
+             stringsAsFactors = FALSE)
+}
+
+# ---- signal ----------------------------------------------------------------
+decimate_block <- function(X, factor) {       # block mean (boxcar anti-alias) + subsample
+  factor <- as.integer(round(factor))
+  if (factor <= 1L) return(X)
+  n <- (nrow(X) %/% factor) * factor
+  if (n == 0L) return(matrix(colMeans(X), nrow = 1, dimnames = list(NULL, colnames(X))))
+  out <- rowsum(X[seq_len(n), , drop = FALSE], rep(seq_len(n / factor), each = factor), reorder = FALSE) / factor
+  rownames(out) <- NULL
+  out
+}
+
+make_windows <- function(X, win, step) {
+  n <- nrow(X)
+  if (n < win) return(list(X[c(seq_len(n), rep(n, win - n)), , drop = FALSE]))  # pad a short segment
+  starts <- seq(1L, n - win + 1L, by = step)
+  lapply(starts, function(s) X[s:(s + win - 1L), , drop = FALSE])
+}
+
+# per-channel scaling fitted on training data, applied to a list of T x C matrices or an N x C x T array
+fit_scaler <- function(mats) {
+  all <- do.call(rbind, mats)
+  list(mu = colMeans(all, na.rm = TRUE), sd = pmax(apply(all, 2, sd, na.rm = TRUE), 1e-8))
+}
+apply_scaler_list <- function(mats, sc) lapply(mats, function(m) sweep(sweep(m, 2, sc$mu), 2, sc$sd, "/"))
+apply_scaler_array <- function(arr, sc) {
+  for (ch in seq_len(dim(arr)[2])) arr[, ch, ] <- (arr[, ch, ] - sc$mu[ch]) / sc$sd[ch]
+  arr
+}
+list_to_array <- function(mats) {             # list of T x C -> N x C x T
+  arr <- array(0, dim = c(length(mats), ncol(mats[[1]]), nrow(mats[[1]])))
+  for (i in seq_along(mats)) arr[i, , ] <- t(mats[[i]])
+  arr
+}
+
+# ---- parallel lapply: fork on Linux / macOS, socket cluster on Windows -------
+par_lapply <- function(X, FUN, export = character(0)) {
+  if (n_cores == 1L || length(X) < 2L) return(lapply(X, FUN))
+  if (.Platform$OS.type != "windows" && !isTRUE(getOption("movement.psock")))
+    return(parallel::mclapply(X, FUN, mc.cores = n_cores))
+  cl <- parallel::makePSOCKcluster(min(n_cores, length(X)))
+  on.exit(parallel::stopCluster(cl), add = TRUE)
+  to_global <- function(o) { if (is.function(o)) environment(o) <- globalenv(); o }
+  objs <- lapply(mget(export, envir = parent.frame(), inherits = TRUE), to_global)
+  parallel::clusterCall(cl, function(o) { list2env(o, envir = globalenv()); NULL }, objs)
+  parallel::parLapply(cl, X, to_global(FUN))
+}
+
+class_palette <- function(classes) setNames(hcl.colors(length(classes), "Dark 3"), classes)
+```
+
+# 1. Data
+
+## 1.1 Load
+
+```{r user-settings}
+# If the automatic column detection below gets it wrong, fill these in and re-knit.
+col_override <- list(id = NULL, task = NULL, time = NULL,
+                     acc = NULL,     # e.g. c("acc_x", "acc_y", "acc_z")
+                     gyro = NULL)    # e.g. c("gyro_x", "gyro_y", "gyro_z")
+crawl_override <- NULL   # the crawling label; if the two crawls have different labels give both, c("2", "8")
+task_names <- NULL       # optional readable names for the plots, e.g. c("1" = "run", "2" = "crawl", ...)
+```
+
+```{r synthetic-generator}
+# Fake recordings in a long CSV layout: 8 stations per child (crawling at stations 2 and 8),
+# unlabeled walks between stations, random sensor dropouts, one segment that is 40% missing.
+make_synthetic_raw <- function(n_children = 24, fs = 100, seed = 1) {
+  set.seed(seed)
+  freq <- c(2.8, 0.8, 2.2, 1.6, 0.5, 0.4, 3.2, 0.8)
+  amp  <- c(3.0, 0.6, 2.5, 2.0, 1.2, 1.0, 4.0, 0.6)
+  base_dur <- c(12, 20, 15, 10, 25, 18, 8, 20)
+  parts <- list()
+  for (c in seq_len(n_children)) {
+    t0 <- 0; id <- sprintf("P%03d", c)
+    for (k in 1:8) {
+      dur <- base_dur[k] * runif(1, 0.7, 1.4); n <- round(dur * fs); t <- seq_len(n) / fs
+      f <- freq[k] * runif(1, 0.85, 1.15); a <- amp[k] * runif(1, 0.8, 1.2) * (1 + 0.15 * (k == 8))
+      X <- cbind(a * sin(2 * pi * f * t) + rnorm(n, 0, 0.3),
+                 1 + 0.5 * a * cos(2 * pi * f * t) + rnorm(n, 0, 0.3),
+                 0.3 * a * sin(4 * pi * f * t + 1) + rnorm(n, 0, 0.3),
+                 50 * a * cos(2 * pi * f * t) + rnorm(n, 0, 10),
+                 20 * a * sin(2 * pi * f * t + 0.5) + rnorm(n, 0, 10),
+                 10 * a * sin(6 * pi * f * t) + rnorm(n, 0, 10))
+      if (runif(1) < 0.3) {
+        X[cbind(sample(n, 10), sample(6, 10, replace = TRUE))] <- NA
+        s0 <- sample(n - 40, 1); X[s0:(s0 + 20), ] <- NA
+      }
+      parts[[length(parts) + 1L]] <- data.table(participant = id, station = k, timestamp = t0 + t,
+                                                 ax = X[, 1], ay = X[, 2], az = X[, 3],
+                                                 gx = X[, 4], gy = X[, 5], gz = X[, 6])
+      t0 <- t0 + dur
+      if (k < 8) {
+        m <- round(0.5 * fs)
+        parts[[length(parts) + 1L]] <- data.table(participant = id, station = NA_integer_, timestamp = t0 + seq_len(m) / fs,
+                                                   ax = rnorm(m), ay = 1 + rnorm(m), az = rnorm(m),
+                                                   gx = rnorm(m, 0, 30), gy = rnorm(m, 0, 30), gz = rnorm(m, 0, 30))
+        t0 <- t0 + m / fs
+      }
+    }
+  }
+  raw <- rbindlist(parts)
+  bad <- raw[participant == "P001" & station == 5L, which = TRUE]
+  raw[bad[seq_len(round(0.4 * length(bad)))], c("ax", "ay", "az", "gx", "gy", "gz") := NA_real_]
+  raw
+}
+```
+
+```{r download, eval = !params$synthetic}
+zenodo_url <- "https://zenodo.org/records/22647205/files/physical_exercise.csv?download=1"
+zenodo_md5 <- "5ea4d80cbcfdaa1e54491821db57ab74"
+csv_path <- file.path(params$data_dir, "physical_exercise.csv")
+dir.create(params$data_dir, showWarnings = FALSE, recursive = TRUE)
+if (!file.exists(csv_path)) {
+  if (!params$download) stop("CSV not found at ", csv_path, " and download = FALSE")
+  message("Downloading 191 MB from Zenodo ...")
+  download.file(zenodo_url, csv_path, mode = "wb")
+}
+cat("md5 matches the Zenodo record:", identical(unname(tools::md5sum(csv_path)), zenodo_md5), "\n")
+```
+
+```{r load}
+if (params$synthetic) {
+  raw <- make_synthetic_raw(n_children = params$n_children_quick, fs = params$fs, seed = params$seed)
+  if (is.null(task_names)) task_names <- c("1" = "run", "2" = "crawl", "3" = "shuttle", "4" = "rings",
+                                           "5" = "balance", "6" = "hoops", "7" = "bench")
+} else {
+  raw <- fread(csv_path)
+}
+str(raw)
+print(head(raw))
+
+guess_columns <- function(dt) {
+  nm <- names(dt); low <- tolower(nm)
+  nun <- vapply(dt, function(v) length(unique(v)), integer(1))
+  pick <- function(pattern, exclude = character(0)) {
+    hit <- setdiff(nm[grepl(pattern, low)], exclude); if (length(hit)) hit else NULL
+  }
+  time <- pick("time|stamp|^t$")
+  acc  <- pick("^acc|^a[xyz]$|accel", time)
+  gyro <- pick("^gyr|^g[xyz]$|gyro|rot", time)
+  id   <- pick("child|subject|participant|proband|person|^id$", c(time, acc, gyro))
+  task <- pick("task|activity|exercise|segment|station|label|class", c(time, acc, gyro, id))
+  if (is.null(id))   id   <- nm[which(nun > 50 & nun < 200 & !(nm %in% c(acc, gyro, time)))][1]
+  if (is.null(task)) task <- nm[which(nun >= 6 & nun <= 12 & !(nm %in% c(id, acc, gyro, time)))][1]
+  list(id = id[1], task = task[1], time = if (length(time)) time[1] else NULL,
+       acc = head(acc, 3), gyro = head(gyro, 3))
+}
+cols <- guess_columns(raw)
+for (k in names(col_override)) if (!is.null(col_override[[k]])) cols[[k]] <- col_override[[k]]
+str(cols)
+stopifnot(!is.null(cols$id), !is.null(cols$task), length(cols$acc) == 3, length(cols$gyro) == 3)
+```
+
+## 1.2 Segments
+
+Rows are kept in file order within each child. Each child's recording is cut into consecutive
+runs of the task label (`rleid`), which gives the 8 segments. The two crawls share one class,
+so the classification target has 7 classes; `seg_label` keeps them apart for the twin test.
+Short gaps inside a segment are filled by linear interpolation; segments that are mostly
+missing are dropped and listed.
+
+```{r segments}
+dt <- raw[, c(cols$id, cols$task, cols$time, cols$acc, cols$gyro), with = FALSE]
+setnames(dt, c("child", "task", if (!is.null(cols$time)) "time", "acc_x", "acc_y", "acc_z", "gyr_x", "gyr_y", "gyr_z"))
+rm(raw); invisible(gc())
+sensor_cols <- c("acc_x", "acc_y", "acc_z", "gyr_x", "gyr_y", "gyr_z")
+for (v in sensor_cols) if (!is.numeric(dt[[v]])) set(dt, j = v, value = suppressWarnings(as.numeric(dt[[v]])))
+dt[, child := trimws(as.character(child))]
+dt[, task := trimws(as.character(task))]
+setorder(dt, child)                            # stable: keeps the file order inside each child
+
+if ("time" %in% names(dt) && (is.numeric(dt$time) || inherits(dt$time, "POSIXt"))) {
+  d <- dt[, .(d = if (inherits(time, "POSIXt")) as.numeric(diff(time), units = "secs") else as.numeric(diff(time))), by = child]$d
+  d <- d[is.finite(d)]
+  cat(sprintf("median time step: %.5g (file units; %.4f s expected at %d Hz); backward steps: %d\n",
+              median(d[d > 0]), 1 / params$fs, params$fs, sum(d < 0)))
+}
+
+cat("rows:", nrow(dt), "\nmissing / non-finite values per sensor column:\n")
+print(dt[, lapply(.SD, function(v) sum(!is.finite(v))), .SDcols = sensor_cols])
+cat("rows without child id:", dt[, sum(is.na(child) | child == "")],
+    "  rows without task label:", dt[, sum(is.na(task) | task == "" | task == "NA")], "\n")
+dt <- dt[!is.na(child) & child != "" & !is.na(task) & task != "" & task != "NA"]
+dt[, seg := rleid(task), by = child]
+
+# which label is crawling?
+task_levels <- sort(unique(dt$task))
+cat("task labels in the file:", paste(task_levels, collapse = ", "), "\n")
+crawl_class <- NULL
+if (!is.null(crawl_override)) {
+  crawl_class <- crawl_override[1]
+  if (length(crawl_override) == 2) dt[task == crawl_override[2], task := crawl_override[1]]
+} else {
+  hit <- task_levels[grepl("crawl|plaz|pliz|pl\u00ed\u017e|lez", tolower(task_levels))]
+  if (length(hit) == 1) {
+    crawl_class <- hit
+  } else if (length(hit) == 2) {
+    crawl_class <- hit[1]; dt[task == hit[2], task := hit[1]]
+  } else if (all(grepl("^[0-9]+$", task_levels)) && all(c("2", "8") %in% task_levels)) {
+    crawl_class <- "2"; dt[task == "8", task := "2"]          # numeric station codes: 8 is the second crawl
+  }
+}
+if (!is.null(task_names)) {
+  dt[task %in% names(task_names), task := unname(task_names[task])]
+  if (!is.null(crawl_class) && crawl_class %in% names(task_names)) crawl_class <- unname(task_names[crawl_class])
+}
+cat("crawling label:", if (is.null(crawl_class)) "NOT DETECTED, set crawl_override" else crawl_class, "\n")
+
+seg_tab <- dt[, .(task = task[1], n = .N,
+                  acc_x = list(acc_x), acc_y = list(acc_y), acc_z = list(acc_z),
+                  gyr_x = list(gyr_x), gyr_y = list(gyr_y), gyr_z = list(gyr_z)),
+              by = .(child, seg)]
+rm(dt); invisible(gc())
+seg_tab[, dur_s := n / params$fs]
+seg_tab[, class := task]
+seg_tab[, seg_label := class]
+if (!is.null(crawl_class)) seg_tab[class == crawl_class, seg_label := paste0(class, "_", seq_len(.N)), by = child]
+seg_tab[, seg_id := paste(child, seg, sep = "_")]
+
+fill_gaps <- function(X) {                    # linear interpolation per channel, ends held constant
+  for (j in seq_len(ncol(X))) {
+    v <- X[, j]; ok <- is.finite(v)
+    if (!any(ok)) return(NULL)
+    if (!all(ok)) X[, j] <- approx(which(ok), v[ok], xout = seq_along(v), rule = 2)$y
+  }
+  X
+}
+max_na_frac <- 0.2                            # drop a segment if more than 20% of its values are missing
+min_len <- params$fs                          # or if it is shorter than 1 s
+
+segments <- lapply(seq_len(nrow(seg_tab)), function(i) {
+  X <- cbind(acc_x = seg_tab$acc_x[[i]], acc_y = seg_tab$acc_y[[i]], acc_z = seg_tab$acc_z[[i]],
+             gyr_x = seg_tab$gyr_x[[i]], gyr_y = seg_tab$gyr_y[[i]], gyr_z = seg_tab$gyr_z[[i]])
+  na_frac <- mean(!is.finite(X))
+  Xf <- if (na_frac <= max_na_frac && nrow(X) >= min_len) fill_gaps(X) else NULL
+  list(seg_id = seg_tab$seg_id[i], child = seg_tab$child[i], class = seg_tab$class[i],
+       seg_label = seg_tab$seg_label[i], X = Xf, na_frac = na_frac)
+})
+seg_tab[, na_frac := vapply(segments, `[[`, numeric(1), "na_frac")]
+kept <- !vapply(segments, function(s) is.null(s$X), logical(1))
+cat(sprintf("segments: %d; with gaps: %d; interpolated: %d; dropped (>%.0f%% missing or < 1 s): %d\n",
+            nrow(seg_tab), sum(seg_tab$na_frac > 0), sum(seg_tab$na_frac > 0 & kept), 100 * max_na_frac, sum(!kept)))
+if (any(!kept)) print(seg_tab[!kept, .(child, seg, task, n, na_frac = round(na_frac, 3))])
+
+# drop labels that are far rarer than the others (stray or mistyped labels)
+cnt <- seg_tab[kept, .N, by = class]
+rare <- cnt[N < 0.2 * median(N), class]
+if (length(rare)) { cat("dropping rare labels:", paste(rare, collapse = ", "), "\n"); kept <- kept & !(seg_tab$class %in% rare) }
+
+segments <- segments[kept]
+seg_meta <- seg_tab[kept, .(seg_id, child, seg, class, seg_label, n, dur_s, na_frac)]
+rm(seg_tab); invisible(gc())
+stopifnot(all(vapply(segments, function(s) all(is.finite(s$X)), logical(1))),
+          identical(vapply(segments, `[[`, "", "seg_id"), seg_meta$seg_id))
+```
+
+## 1.3 Audit
+
+```{r audit}
+classes <- sort(unique(seg_meta$class))
+pal <- class_palette(classes)
+cat("children:", length(unique(seg_meta$child)), " segments:", nrow(seg_meta), " classes:", length(classes), "\n")
+print(table(segments_per_child = seg_meta[, .N, by = child]$N))   # expect 8
+print(seg_meta[, .(n = .N, median_dur_s = median(dur_s), min_dur_s = min(dur_s), max_dur_s = max(dur_s),
+                   with_gaps = sum(na_frac > 0)), by = class][order(class)])
+
+ggplot(seg_meta, aes(x = class, y = dur_s, fill = class)) + geom_boxplot(show.legend = FALSE) +
+  scale_fill_manual(values = pal) + labs(title = "Segment duration by task", y = "seconds", x = NULL) + theme_minimal()
+
+rng <- do.call(rbind, lapply(segments[seq_len(min(50, length(segments)))], function(s) apply(s$X, 2, range)))
+cat("value ranges over the first 50 segments (check units: g vs m/s^2, deg/s):\n")
+print(round(apply(rng, 2, range), 2))
+```
+
+```{r subsample}
+if (params$quick && !params$synthetic) {
+  keep <- sort(sample(unique(seg_meta$child), min(params$n_children_quick, length(unique(seg_meta$child)))))
+  sel <- seg_meta$child %in% keep
+  segments <- segments[sel]; seg_meta <- seg_meta[sel]
+  cat("quick mode: using", length(keep), "children,", nrow(seg_meta), "segments\n")
+}
+children <- sort(unique(seg_meta$child))
+folds <- make_folds(children, k = params$k_folds, repeats = params$repeats, seed = params$seed)
+cat(length(folds), "folds\n")
+```
+
+# 2. Windows and whole segments
+
+Windows of `r params$win_sec` s with `r params$overlap * 100`% overlap. Features use the
+100 Hz windows; DTW-SOM, MiniRocket and Mantis use the same windows at `r params$fs_low` Hz.
+The whole segments are also kept at `r params$fs_seg` Hz, each with its own length, for the
+variable-length DTW-SOM.
+
+```{r windows}
+win_hi <- params$win_sec * params$fs
+step_hi <- max(1L, round(win_hi * (1 - params$overlap)))
+dec_lo <- params$fs / params$fs_low
+dec_seg <- params$fs / params$fs_seg
+stopifnot(dec_lo == round(dec_lo), dec_seg == round(dec_seg))
+
+ws_all <- lapply(segments, function(s) make_windows(s$X, win_hi, step_hi))
+n_w <- lengths(ws_all)
+win_list <- unlist(ws_all, recursive = FALSE); rm(ws_all)
+win_meta <- data.table(seg_id = rep(seg_meta$seg_id, n_w), child = rep(seg_meta$child, n_w),
+                       class = rep(seg_meta$class, n_w), seg_label = rep(seg_meta$seg_label, n_w),
+                       w = sequence(n_w))
+win_meta[, win_id := .I]
+win_lo <- lapply(win_list, decimate_block, factor = dec_lo)
+seg_lo <- lapply(segments, function(s) decimate_block(s$X, dec_seg))
+names(seg_lo) <- seg_meta$seg_id
+if (run_minirocket || run_mantis) arr_lo <- list_to_array(win_lo)
+cat(sprintf("%d windows of %d samples (%d at %d Hz); %d whole segments of %d to %d samples at %d Hz\n",
+            nrow(win_meta), win_hi, nrow(win_lo[[1]]), params$fs_low, length(seg_lo),
+            min(vapply(seg_lo, nrow, 1L)), max(vapply(seg_lo, nrow, 1L)), params$fs_seg))
+```
+
+# 3. Features (route C1)
+
+RQA follows the article's design: the three accelerometer axes form the state vector (no delay
+embedding), likewise the three gyroscope axes. What changes: the threshold is chosen per window
+for a fixed recurrence rate (5%) instead of a fixed distance, and a Theiler window excludes the
+main diagonal. catch22 gives 22 general-purpose features per channel.
+
+```{r features}
+basic_block <- function(v, prefix) {
+  d <- diff(v)
+  out <- c(mean = mean(v), sd = sd(v), min = min(v), max = max(v),
+           rms = sqrt(mean(v^2)), mad_diff = mean(abs(d)), zcr = mean(diff(sign(v - mean(v))) != 0))
+  setNames(out, paste0(prefix, "_", names(out)))
+}
+rqa_names <- if (have_chaos) names(unlist(chaosrcpp::rqa_features(matrix(rnorm(300), 100, 3), rr = 0.05))) else character(0)
+rqa_block <- function(M, prefix) {
+  f <- tryCatch(unlist(chaosrcpp::rqa_features(M, rr = 0.05, theiler = 1L, lmin = 2L, vmin = 2L)),
+                error = function(e) NULL)
+  if (length(f) != length(rqa_names)) f <- rep(NA_real_, length(rqa_names))
+  setNames(as.numeric(f), paste0(prefix, "_", rqa_names))
+}
+catch22_names <- if (run_catch22) suppressWarnings(Rcatch22::catch22_all(rnorm(200)))[["names"]] else character(0)
+catch22_block <- function(v, prefix) {
+  r <- tryCatch(suppressWarnings(Rcatch22::catch22_all(v)), error = function(e) NULL)
+  vals <- if (is.null(r)) rep(NA_real_, length(catch22_names)) else as.numeric(r[["values"]])[match(catch22_names, r[["names"]])]
+  setNames(vals, paste0(prefix, "_", catch22_names))
+}
+featurize_window <- function(W) {
+  acc <- W[, 1:3]; gyr <- W[, 4:6]
+  ch <- cbind(W, acc_mag = sqrt(rowSums(acc^2)), gyr_mag = sqrt(rowSums(gyr^2)))
+  out <- unlist(lapply(colnames(ch), function(nm) basic_block(ch[, nm], nm)))
+  if (have_chaos) out <- c(out, rqa_block(acc, "rqa_acc"), rqa_block(gyr, "rqa_gyr"))
+  if (run_catch22) out <- c(out, unlist(lapply(colnames(ch), function(nm) catch22_block(ch[, nm], nm))))
+  out
+}
+
+feat_file <- file.path(params$data_dir, sprintf("cache_features_%s_seed%d_%dchildren_%dwin_%gs_%g_rqa%d_c22%d.rds",
+                       if (params$synthetic) "synthetic" else "real", params$seed, length(children), nrow(win_meta),
+                       params$win_sec, params$overlap, have_chaos, run_catch22))
+if (params$use_cache && !params$synthetic && file.exists(feat_file)) {
+  feat <- readRDS(feat_file); cat("features loaded from", feat_file, "\n")
+} else {
+  t0 <- Sys.time()
+  feat_list <- par_lapply(win_list, featurize_window,
+                          export = c("featurize_window", "basic_block", "rqa_block", "catch22_block",
+                                     "rqa_names", "catch22_names", "have_chaos", "run_catch22"))
+  stopifnot(length(unique(lengths(feat_list))) == 1)
+  feat <- do.call(rbind, feat_list); rm(feat_list)
+  feat[!is.finite(feat)] <- NA
+  cat(sprintf("%d windows x %d features in %.1f s\n", nrow(feat), ncol(feat), as.numeric(Sys.time() - t0, units = "secs")))
+  if (params$use_cache && !params$synthetic) { dir.create(params$data_dir, showWarnings = FALSE); saveRDS(feat, feat_file) }
+}
+stopifnot(nrow(feat) == nrow(win_meta))
+cat("features with any missing value:", sum(colSums(is.na(feat)) > 0), "of", ncol(feat), "\n")
+
+# segment-level features (mean over the windows of a segment) for the feature map in section 7
+ok <- !is.na(feat)
+feat_seg <- rowsum(ifelse(ok, feat, 0), win_meta$seg_id) / pmax(rowsum(ok * 1, win_meta$seg_id), 1)
+feat_seg <- feat_seg[seg_meta$seg_id, , drop = FALSE]
+```
+
+# 4. Models
+
+Every model function takes training and test data and returns a score matrix with one column
+per class, which is then averaged per segment.
+
+```{r model-functions}
+fit_duration <- function(seg_tr, seg_te, classes) {
+  y <- droplevels(factor(seg_tr$class, levels = classes))
+  m <- nnet::multinom(y ~ log(dur_s), data = data.frame(y = y, dur_s = seg_tr$dur_s), trace = FALSE, maxit = 500)
+  p <- predict(m, newdata = data.frame(dur_s = seg_te$dur_s), type = "probs")
+  if (!is.matrix(p)) p <- matrix(p, nrow = nrow(seg_te), byrow = TRUE, dimnames = list(NULL, levels(y)))
+  out <- matrix(0, nrow(seg_te), length(classes), dimnames = list(NULL, classes))
+  out[, colnames(p)] <- p
+  out
+}
+
+xgb_params <- function(K) list(objective = "multi:softprob", num_class = K, eta = 0.05, max_depth = 4,
+                               subsample = 0.8, colsample_bytree = 0.8, min_child_weight = 2, nthread = n_cores)
+fit_xgb <- function(Xtr, ytr, Xte, classes, nrounds = 300, top_k = NULL) {
+  y_i <- as.integer(factor(ytr, classes)) - 1L
+  train <- function(X) xgboost::xgb.train(params = xgb_params(length(classes)),
+                                          data = xgboost::xgb.DMatrix(X, label = y_i), nrounds = nrounds, verbose = 0)
+  m <- train(Xtr)
+  if (!is.null(top_k)) {                     # the article's selection step, but inside the fold
+    keep <- head(xgboost::xgb.importance(model = m)$Feature, top_k)
+    Xtr <- Xtr[, keep, drop = FALSE]; Xte <- Xte[, keep, drop = FALSE]
+    m <- train(Xtr)
+  }
+  p <- predict(m, xgboost::xgb.DMatrix(Xte))
+  if (!is.matrix(p)) p <- matrix(p, ncol = length(classes), byrow = TRUE)
+  colnames(p) <- classes
+  list(scores = p, model = m)
+}
+
+# map SOM units to classes by majority of the training data; empty units inherit the nearest unit's class
+unit_to_class <- function(unit_tr, ytr, D_units, classes) {
+  uc <- rep(NA_character_, nrow(D_units))
+  maj <- tapply(ytr, unit_tr, function(v) names(which.max(table(factor(v, classes)))))
+  uc[as.integer(names(maj))] <- maj
+  for (u in which(is.na(uc))) { cand <- which(!is.na(uc)); uc[u] <- uc[cand[which.min(D_units[u, cand])]] }
+  uc
+}
+one_hot <- function(lab, classes) {
+  m <- matrix(0, length(lab), length(classes), dimnames = list(NULL, classes))
+  m[cbind(seq_along(lab), match(lab, classes))] <- 1
+  m
+}
+super_clusters <- function(D, k) cutree(hclust(as.dist(D), "ward.D2"), k = min(k, nrow(D)))
+
+fit_som <- function(Ftr, ytr, Fte, yte, classes, xdim = params$som_xdim, ydim = params$som_ydim, rlen = 200) {
+  mu <- colMeans(Ftr, na.rm = TRUE); sdv <- apply(Ftr, 2, sd, na.rm = TRUE); sdv[!is.finite(sdv) | sdv == 0] <- 1
+  Ztr <- scale(Ftr, mu, sdv); Zte <- scale(Fte, mu, sdv); Ztr[!is.finite(Ztr)] <- 0; Zte[!is.finite(Zte)] <- 0
+  s <- kohonen::som(Ztr, grid = kohonen::somgrid(xdim, ydim, "hexagonal"), rlen = rlen, mode = "batch")
+  codes <- s$codes[[1]]; D <- as.matrix(dist(codes))
+  unit_tr <- s$unit.classif; unit_te <- kohonen::map(s, Zte)$unit.classif
+  uc <- unit_to_class(unit_tr, ytr, D, classes)
+  super <- super_clusters(D, length(classes))
+  cent <- t(sapply(sort(unique(super)), function(k) colMeans(codes[super == k, , drop = FALSE])))
+  sc <- unit_to_class(super[unit_tr], ytr, as.matrix(dist(cent)), classes)
+  list(scores_unit = one_hot(uc[unit_te], classes), scores_super = one_hot(sc[super[unit_te]], classes),
+       ari_unit = ari(yte, unit_te), ari_super = ari(yte, super[unit_te]), som = s)
+}
+
+fit_dtwsom <- function(Ltr, ytr, Lte, yte, classes, xdim = params$som_xdim, ydim = params$som_ydim,
+                       epochs = 15, window = NULL, seed = 1) {
+  while (xdim * ydim > length(Ltr) && xdim > 2) { xdim <- xdim - 1L; ydim <- ydim - 1L }
+  if (is.null(window)) window <- max(2L, round(0.1 * median(vapply(Ltr, nrow, 1L))))
+  fit <- dtwsom::dtw_som(Ltr, xdim = xdim, ydim = ydim, topo = "hexagonal", epochs = epochs, mode = "batch",
+                         window = window, smooth = 3, normalize = "none", threads = n_cores,
+                         seed = seed, verbose = FALSE)
+  D <- dtwsom::dtw_pairwise(fit$codes, window = window, threads = n_cores)
+  unit_tr <- fit$unit.classif
+  unit_te <- predict(fit, Lte, threads = n_cores)$bmu
+  uc <- unit_to_class(unit_tr, ytr, D, classes)
+  super <- super_clusters(D, length(classes)); ks <- max(super)
+  Dsup <- matrix(0, ks, ks)
+  for (a in seq_len(ks)) for (b in seq_len(ks)) Dsup[a, b] <- mean(D[super == a, super == b, drop = FALSE])
+  sc <- unit_to_class(super[unit_tr], ytr, Dsup, classes)
+  list(scores_unit = one_hot(uc[unit_te], classes), scores_super = one_hot(sc[super[unit_te]], classes),
+       ari_unit = ari(yte, unit_te), ari_super = ari(yte, super[unit_te]), fit = fit)
+}
+```
+
+```{python minirocket-py, eval = run_minirocket}
+import numpy as np
+from aeon.transformations.collection.convolution_based import MiniRocket
+from sklearn.linear_model import RidgeClassifierCV
+
+def minirocket_fit_predict(Xtr, ytr, Xte, n_kernels=10000, seed=0, n_jobs=1):
+    Xtr = np.ascontiguousarray(Xtr, dtype=np.float32)
+    Xte = np.ascontiguousarray(Xte, dtype=np.float32)
+    tf = MiniRocket(n_kernels=int(n_kernels), random_state=int(seed), n_jobs=int(n_jobs))
+    Ftr = tf.fit_transform(Xtr)
+    Fte = tf.transform(Xte)
+    clf = RidgeClassifierCV(alphas=np.logspace(-3, 3, 10)).fit(Ftr, np.asarray(ytr))
+    return {"scores": clf.decision_function(Fte), "classes": [str(c) for c in clf.classes_]}
+```
+
+```{python mantis-py, eval = run_mantis}
+import numpy as np
+import torch
+import torch.nn.functional as F
+from mantis.architecture import MantisV1, MantisV2
+from mantis.trainer import MantisTrainer
+from sklearn.ensemble import RandomForestClassifier
+
+def mantis_embed(X, checkpoint="paris-noah/MantisV2", layer=2, device="cpu", batch_size=256, n_threads=1):
+    """Frozen encoder. X: (n, channels, T). Each channel is embedded separately and concatenated."""
+    torch.set_num_threads(int(n_threads))
+    cls = MantisV2 if "V2" in checkpoint else MantisV1
+    net = cls(device=device, return_transf_layer=int(layer), output_token="combined").from_pretrained(checkpoint)
+    model = MantisTrainer(device=device, network=net)
+    X = np.ascontiguousarray(X, dtype=np.float32)
+    Xr = F.interpolate(torch.tensor(X), size=512, mode="linear", align_corners=False).numpy()
+    return model.transform(Xr, batch_size=int(batch_size))
+
+def rf_fit_predict(Ztr, ytr, Zte, seed=0, n_jobs=1):
+    clf = RandomForestClassifier(n_estimators=300, random_state=int(seed), n_jobs=int(n_jobs))
+    clf.fit(np.asarray(Ztr), np.asarray(ytr))
+    return {"scores": clf.predict_proba(np.asarray(Zte)), "classes": [str(c) for c in clf.classes_]}
+```
+
+The Mantis encoder is frozen, so the embeddings are computed once. They use one global scaling
+per channel computed from all windows without labels; the random forest is trained inside each fold.
+
+```{r mantis-embed, eval = run_mantis}
+t0 <- Sys.time()
+Z_mantis <- py$mantis_embed(apply_scaler_array(arr_lo, fit_scaler(win_lo)), n_threads = n_cores)
+cat(sprintf("Mantis embeddings: %d x %d in %.0f s\n", nrow(Z_mantis), ncol(Z_mantis), as.numeric(Sys.time() - t0, units = "secs")))
+```
+
+# 5. Cross-validation
+
+```{r cv-loop}
+quick <- params$quick
+results <- list(); cluster_quality <- list(); twin_results <- list(); timing <- list()
+
+add_result <- function(method, scores, seg_ids, f) {
+  ag <- aggregate_scores(scores, seg_ids, classes)
+  ag$method <- method; ag$rep <- f$rep; ag$fold <- f$fold
+  results[[length(results) + 1L]] <<- ag
+}
+add_quality <- function(method, fit, f) {
+  cluster_quality[[length(cluster_quality) + 1L]] <<- data.frame(method = method, rep = f$rep, fold = f$fold,
+                                                                 ari_unit = fit$ari_unit, ari_super = fit$ari_super)
+}
+timed <- function(method, f, expr) {
+  t0 <- Sys.time(); val <- expr
+  timing[[length(timing) + 1L]] <<- data.frame(method = method, rep = f$rep, fold = f$fold,
+                                               seconds = as.numeric(Sys.time() - t0, units = "secs"))
+  val
+}
+
+for (fi in seq_along(folds)) {
+  f <- folds[[fi]]
+  te_idx <- which(win_meta$child %in% f$test); tr_idx <- which(!(win_meta$child %in% f$test))
+  ytr <- win_meta$class[tr_idx]; yte <- win_meta$class[te_idx]; seg_te <- win_meta$seg_id[te_idx]
+  s_tr <- which(!(seg_meta$child %in% f$test)); s_te <- which(seg_meta$child %in% f$test)
+  cat(sprintf("rep %d fold %d: %d train / %d test windows, %d / %d segments, %d test children\n",
+              f$rep, f$fold, length(tr_idx), length(te_idx), length(s_tr), length(s_te), length(f$test)))
+
+  ## baseline: duration only
+  add_result("Duration only", fit_duration(seg_meta[s_tr], seg_meta[s_te], classes), seg_meta$seg_id[s_te], f)
+
+  ## C1: features -> XGBoost (all features, and the article's top-27 chosen inside the fold)
+  nr <- if (quick) 150 else 400
+  xg <- timed("XGBoost, all features", f, fit_xgb(feat[tr_idx, , drop = FALSE], ytr, feat[te_idx, , drop = FALSE], classes, nrounds = nr))
+  add_result("XGBoost, all features", xg$scores, seg_te, f)
+  xg27 <- timed("XGBoost, top-27 in-fold", f, fit_xgb(feat[tr_idx, , drop = FALSE], ytr, feat[te_idx, , drop = FALSE], classes, nrounds = nr, top_k = 27))
+  add_result("XGBoost, top-27 in-fold", xg27$scores, seg_te, f)
+
+  ## C1: features -> kohonen SOM
+  so <- timed("SOM features", f, fit_som(feat[tr_idx, , drop = FALSE], ytr, feat[te_idx, , drop = FALSE], yte, classes,
+                                            rlen = if (quick) 100 else 300))
+  add_result("SOM features, unit majority", so$scores_unit, seg_te, f)
+  add_result("SOM features, 7 super-clusters", so$scores_super, seg_te, f)
+  add_quality("SOM features (windows)", so, f)
+
+  ## C2: DTW-SOM on the raw 4 s windows
+  if (run_dtwsom) {
+    sc <- fit_scaler(win_lo[tr_idx])
+    ds <- timed("DTW-SOM windows", f, fit_dtwsom(apply_scaler_list(win_lo[tr_idx], sc), ytr, apply_scaler_list(win_lo[te_idx], sc), yte,
+                                                 classes, epochs = if (quick) 10 else 30, seed = params$seed + fi))
+    add_result("DTW-SOM windows, unit majority", ds$scores_unit, seg_te, f)
+    add_result("DTW-SOM windows, 7 super-clusters", ds$scores_super, seg_te, f)
+    add_quality("DTW-SOM (windows)", ds, f)
+  }
+
+  ## C2: DTW-SOM on whole segments of different lengths
+  if (run_dtwsom_seg) {
+    sc <- fit_scaler(seg_lo[s_tr])
+    ws <- max(2L, round(0.1 * median(vapply(seg_lo[s_tr], nrow, 1L))))
+    dss <- timed("DTW-SOM segments", f, fit_dtwsom(apply_scaler_list(seg_lo[s_tr], sc), seg_meta$class[s_tr],
+                                                   apply_scaler_list(seg_lo[s_te], sc), seg_meta$class[s_te], classes,
+                                                   epochs = if (quick) 15 else 40, window = ws, seed = params$seed + fi))
+    add_result("DTW-SOM segments, unit majority", dss$scores_unit, seg_meta$seg_id[s_te], f)
+    add_result("DTW-SOM segments, 7 super-clusters", dss$scores_super, seg_meta$seg_id[s_te], f)
+    add_quality("DTW-SOM (segments)", dss, f)
+  }
+
+  ## A: MiniRocket + ridge
+  if (run_minirocket) {
+    sc <- fit_scaler(win_lo[tr_idx])
+    mr <- timed("MiniRocket + ridge", f, py$minirocket_fit_predict(apply_scaler_array(arr_lo[tr_idx, , , drop = FALSE], sc), ytr,
+                                                                   apply_scaler_array(arr_lo[te_idx, , , drop = FALSE], sc),
+                                                                   n_kernels = if (quick) 2000 else 10000, seed = params$seed, n_jobs = n_cores))
+    add_result("MiniRocket + ridge", `colnames<-`(mr$scores, unlist(mr$classes)), seg_te, f)
+  }
+
+  ## B: Mantis frozen embeddings + random forest
+  if (run_mantis) {
+    ma <- timed("Mantis frozen + RF", f, py$rf_fit_predict(Z_mantis[tr_idx, , drop = FALSE], ytr, Z_mantis[te_idx, , drop = FALSE],
+                                                           seed = params$seed, n_jobs = n_cores))
+    add_result("Mantis frozen + RF", `colnames<-`(ma$scores, unlist(ma$classes)), seg_te, f)
+  }
+
+  ## twin test: can an 8-label model tell the first crawl from the second?
+  if (params$run_twin_test && !is.null(crawl_class)) {
+    labs8 <- sort(unique(win_meta$seg_label))
+    tw <- fit_xgb(feat[tr_idx, , drop = FALSE], win_meta$seg_label[tr_idx], feat[te_idx, , drop = FALSE], labs8, nrounds = nr)
+    ag <- aggregate_scores(tw$scores, seg_te, labs8); ag$rep <- f$rep; ag$fold <- f$fold
+    twin_results[[length(twin_results) + 1L]] <- ag
+  }
+}
+```
+
+# 6. Results
+
+```{r results-table}
+res <- rbindlist(results, use.names = TRUE)
+res <- merge(res, seg_meta[, .(seg_id, child, class)], by = "seg_id")
+per_fold <- res[, as.list(metrics(class, pred, classes)), by = .(method, rep, fold)]
+summary_tab <- per_fold[, .(balanced_accuracy = mean(balanced_accuracy), sd = sd(balanced_accuracy),
+                            macro_f1 = mean(macro_f1), folds = .N), by = method]
+if (length(timing)) {                        # one fit serves both mappings of a SOM: match on the name before the comma
+  tim <- rbindlist(timing)[, .(fit_seconds = round(mean(seconds), 1)), by = .(key = method)]
+  summary_tab[, key := ifelse(method %in% tim$key, method, sub(",.*$", "", method))]
+  summary_tab <- merge(summary_tab, tim, by = "key", all.x = TRUE)[, key := NULL]
+}
+setorder(summary_tab, -balanced_accuracy)
+if (params$save_figures && !params$synthetic) {
+  dir.create("figures", showWarnings = FALSE)
+  writeLines(c("# Results of the latest run", "",
+               sprintf("%s: %d children, %d folds x %d repeats, quick = %s. Balanced accuracy and macro F1 on held-out children.",
+                       format(Sys.Date()), length(children), params$k_folds, params$repeats, params$quick), "",
+               knitr::kable(summary_tab, format = "pipe", digits = 3)), "figures/results_table.md")
+}
+knitr::kable(summary_tab, digits = 3, caption = "Segment-level performance on held-out children (mean over folds)")
+```
+
+```{r results-plot, fig.height = 6}
+per_fold[, method := factor(method, levels = rev(summary_tab$method))]
+ggplot(per_fold, aes(x = method, y = balanced_accuracy)) +
+  geom_boxplot(outlier.shape = NA, fill = "grey92") + geom_jitter(width = 0.15, height = 0, alpha = 0.6) +
+  coord_flip() + labs(title = "Balanced accuracy per fold (held-out children)", x = NULL, y = "balanced accuracy") +
+  theme_minimal()
+```
+
+## Clustering quality
+
+Adjusted Rand index between the tasks of the held-out data and (a) the SOM unit they land on,
+(b) the super-cluster. This is the comparison closest to the article's own question.
+
+```{r cluster-quality}
+if (length(cluster_quality)) {
+  cq <- rbindlist(cluster_quality)[, .(ari_unit = mean(ari_unit), ari_super = mean(ari_super), folds = .N), by = method]
+  knitr::kable(cq, digits = 3)
+}
+```
+
+## Confusion matrix of the best method
+
+```{r confusion, fig.height = 5.5}
+best <- as.character(summary_tab$method[1])
+cm <- res[method == best, table(truth = factor(class, levels = classes), pred = factor(pred, levels = classes))]
+cat("best:", best, "\n"); print(cm)
+ggplot(as.data.frame(cm), aes(x = pred, y = truth, fill = Freq)) + geom_tile() + geom_text(aes(label = Freq)) +
+  scale_fill_gradient(low = "white", high = "steelblue") +
+  labs(title = paste("Confusion,", best), x = "predicted", y = "true") +
+  theme_minimal() + theme(axis.text.x = element_text(angle = 30, hjust = 1))
+```
+
+## Twin test
+
+The first and the second crawl are the same movement. An 8-label model that separates them is
+learning the position in the protocol (fatigue, order) rather than the movement, and that would
+also inflate any 8-class result.
+
+```{r twin-test}
+if (length(twin_results)) {
+  tw <- merge(rbindlist(twin_results), seg_meta[, .(seg_id, class, seg_label)], by = "seg_id")
+  crawl <- tw[class == crawl_class]
+  print(crawl[, table(true_segment = seg_label, predicted = pred)])
+  cat(sprintf("crawl segments recognised as crawling: %.1f%%; first vs second crawl told apart: %.1f%% (50%% = indistinguishable)\n",
+              100 * crawl[, mean(startsWith(pred, paste0(crawl_class, "_")))], 100 * crawl[, mean(pred == seg_label)]))
+}
+```
+
+## Feature importance (last fold, all-feature XGBoost)
+
+```{r importance}
+imp <- xgboost::xgb.importance(model = xg$model)
+knitr::kable(head(imp, 25), digits = 3)
+```
+
+# 7. SOM maps
+
+These maps are descriptive: they are trained on all children in the run (no held-out data),
+to look at what the maps learn.
+
+## 7.1 DTW-SOM on whole segments
+
+Every segment enters the map at its own length. A prototype keeps the length of the segment it
+was initialised from, and batch training averages the mapped segments along their DTW paths
+(DBA-style), so the codebooks end up with different lengths.
+
+```{r map-dtwsom, eval = run_maps}
+sc_map <- fit_scaler(seg_lo)
+w_map <- max(2L, round(0.1 * median(vapply(seg_lo, nrow, 1L))))
+map_fit <- dtwsom::dtw_som(apply_scaler_list(seg_lo, sc_map), xdim = params$som_xdim, ydim = params$som_ydim,
+                           topo = "hexagonal", epochs = if (params$quick) 20 else 40, mode = "batch",
+                           window = w_map, smooth = 3, normalize = "none", threads = n_cores,
+                           seed = params$seed, verbose = FALSE)
+print(map_fit)
+map_labels <- seg_meta$class
+ch <- match(params$plot_channel, colnames(seg_lo[[1]])); if (is.na(ch)) ch <- 1L
+K_map <- length(map_fit$codes)
+tab_map <- table(unit = factor(map_fit$unit.classif, levels = seq_len(K_map)), task = factor(map_labels, levels = classes))
+unit_info <- data.frame(unit = seq_len(K_map), n = rowSums(tab_map),
+                        majority = ifelse(rowSums(tab_map) > 0, classes[max.col(tab_map, ties.method = "first")], NA),
+                        purity = round(ifelse(rowSums(tab_map) > 0, apply(tab_map, 1, max) / pmax(rowSums(tab_map), 1), NA), 2),
+                        codebook_s = vapply(map_fit$codes, nrow, 1L) / params$fs_seg)
+cat(sprintf("Sakoe-Chiba window %d samples; ARI(units, task) = %.3f\n", w_map, ari(map_labels, map_fit$unit.classif)))
+knitr::kable(unit_info, caption = "Units: hits, majority task, purity, codebook length in seconds")
+```
+
+**The map.** Each hexagon is a unit, filled with its majority task (stronger colour = purer unit).
+The black line is the codebook (grey for units that no segment chose), the thin lines are the
+segments mapped to it, coloured by their task. All lines share one time scale (bar at the bottom), so a short codebook stops early and the
+different lengths are visible directly. The label gives the unit number, hits and codebook length.
+
+```{r hex-map-function, eval = run_maps}
+hex_series_map <- function(fit, labels, channel = 1, sc = NULL, fs = 10, pal, max_members = 20,
+                           title = NULL, subtitle = NULL, seed = 1) {
+  g <- fit$grid; K <- nrow(g$pts); lv <- names(pal)
+  unscale <- function(v) if (is.null(sc)) v else v * sc$sd[channel] + sc$mu[channel]
+  bmu <- fit$unit.classif
+  tab <- table(factor(bmu, levels = seq_len(K)), factor(labels, levels = lv))
+  n_u <- rowSums(tab)
+  major <- ifelse(n_u > 0, lv[max.col(tab, ties.method = "first")], NA_character_)
+  purity <- ifelse(n_u > 0, apply(tab, 1, max) / pmax(n_u, 1), 0)
+
+  ang <- seq(30, 330, by = 60) * pi / 180; R <- 0.5 / cos(pi / 6)       # pointy-top hexagons, like kohonen
+  hex <- data.frame(unit = rep(seq_len(K), each = 6),
+                    x = rep(g$pts[, 1], each = 6) + R * cos(ang),
+                    y = rep(g$pts[, 2], each = 6) + R * sin(ang))
+  hex$major <- factor(major[hex$unit], levels = lv)
+  hex$purity <- purity[hex$unit]
+
+  set.seed(seed)
+  shown <- unlist(lapply(seq_len(K), function(k) { m <- which(bmu == k); if (length(m) > max_members) sample(m, max_members) else m }))
+  Tmax <- max(vapply(fit$codes, nrow, 1L), vapply(fit$data[shown], nrow, 1L))
+  vals <- unscale(c(unlist(lapply(fit$codes, function(m) m[, channel])), unlist(lapply(fit$data[shown], function(m) m[, channel]))))
+  vr <- quantile(vals, c(0.01, 0.99), names = FALSE)
+  box_w <- 0.84; y_lo <- -0.30; y_hi <- 0.20                          # series box inside the hexagon
+  to_xy <- function(v, k) {
+    v <- unscale(v)
+    data.frame(x = g$pts[k, 1] - box_w / 2 + box_w * (seq_along(v) - 1) / (Tmax - 1),
+               y = g$pts[k, 2] + y_lo + (y_hi - y_lo) * pmin(pmax((v - vr[1]) / diff(vr), 0), 1))
+  }
+  mem <- do.call(rbind, lapply(shown, function(s) cbind(to_xy(fit$data[[s]][, channel], bmu[s]), id = s,
+                                                         class = factor(labels[s], levels = lv))))
+  cod <- do.call(rbind, lapply(seq_len(K), function(k) cbind(to_xy(fit$codes[[k]][, channel], k), unit = k,
+                                                              used = n_u[k] > 0)))
+  txt <- data.frame(x = g$pts[, 1], y = g$pts[, 2] + 0.36,
+                    label = sprintf("%d: n=%d, %.0fs", seq_len(K), n_u, vapply(fit$codes, nrow, 1L) / fs))
+  bar_w <- box_w * (10 * fs) / (Tmax - 1)
+  x0 <- min(g$pts[, 1]) - 0.42; y0 <- min(g$pts[, 2]) - 0.72
+  ggplot() +
+    geom_polygon(data = hex, aes(x, y, group = unit, fill = major, alpha = purity), colour = "white", linewidth = 0.8) +
+    geom_path(data = mem, aes(x, y, group = id, colour = class), linewidth = 0.3, alpha = 0.6) +
+    geom_path(data = cod[!cod$used, ], aes(x, y, group = unit), colour = "grey55", linewidth = 0.45) +
+    geom_path(data = cod[cod$used, ], aes(x, y, group = unit), colour = "black", linewidth = 0.6) +
+    geom_text(data = txt, aes(x, y, label = label), size = 2.3, colour = "grey15") +
+    annotate("segment", x = x0, xend = x0 + bar_w, y = y0, yend = y0, linewidth = 0.8) +
+    annotate("text", x = x0 + bar_w + 0.06, y = y0, label = "10 s", hjust = 0, size = 3) +
+    scale_fill_manual(values = pal, na.value = "grey92", drop = FALSE, name = "task") +
+    scale_colour_manual(values = pal, guide = "none") +
+    scale_alpha(range = c(0.12, 0.5), guide = "none") +
+    guides(fill = guide_legend(override.aes = list(alpha = 0.5))) +
+    coord_equal() + theme_void(base_size = 11) +
+    labs(title = title, subtitle = subtitle)
+}
+```
+
+```{r map-hex, eval = run_maps, fig.width = 10, fig.height = 9}
+hex_series_map(map_fit, map_labels, channel = ch, sc = sc_map, fs = params$fs_seg, pal = pal,
+               title = "DTW-SOM on whole segments: codebooks (black) and mapped segments",
+               subtitle = sprintf("channel %s, %d Hz; up to 20 segments drawn per unit", colnames(seg_lo[[1]])[ch], params$fs_seg))
+```
+
+**Lengths.** Each unit's codebook length (black diamond) next to the durations of the segments
+mapped to it. A good map puts segments near their codebook's length; DTW absorbs the rest.
+
+```{r map-lengths, eval = run_maps, fig.height = 4.5}
+mem_len <- data.frame(unit = factor(map_fit$unit.classif, levels = seq_len(K_map)),
+                      dur_s = vapply(map_fit$data, nrow, 1L) / params$fs_seg, task = map_labels)
+ggplot() +
+  geom_jitter(data = mem_len, aes(unit, dur_s, colour = task), width = 0.2, height = 0, alpha = 0.75, size = 1.4) +
+  geom_point(data = unit_info, aes(factor(unit, levels = seq_len(K_map)), codebook_s, fill = n > 0), shape = 23, size = 3.2) +
+  scale_fill_manual(values = c(`TRUE` = "black", `FALSE` = "white"), guide = "none") +
+  scale_colour_manual(values = pal) + scale_x_discrete(drop = FALSE) +
+  labs(x = "unit", y = "seconds", title = "Codebook length (diamond) and durations of the mapped segments") +
+  theme_minimal()
+```
+
+**The package's own views.** `plot(fit, "members")` draws every unit with its members on their
+own sample index; `"members_dtw"` warps each member onto its codebook's time axis along the DTW
+path, which shows how well the codebook describes its members.
+
+```{r map-members, eval = run_maps, fig.width = 11, fig.height = 9}
+plot(map_fit, "members", channel = ch)
+```
+
+```{r map-members-dtw, eval = run_maps, fig.width = 11, fig.height = 9}
+plot(map_fit, "members_dtw", channel = ch)
+```
+
+```{r map-quality, eval = run_maps, fig.width = 12, fig.height = 4.5}
+op <- par(mfrow = c(1, if (has("MASS")) 4 else 3), mar = c(1, 1, 3, 1))
+plot(map_fit, "counts", main = "hits per unit")
+plot(map_fit, "umatrix", main = "U-matrix (DTW)")
+if (has("MASS")) plot(map_fit, "elastic", main = "elastic layout")
+par(mar = c(4, 4, 3, 1)); plot(map_fit, "qe")
+par(op)
+```
+
+## 7.2 Feature SOM (the article's view)
+
+Segment-level features (mean over the segment's windows), standardised, on a 5x5 hexagonal
+kohonen map. Background colour is the unit's majority task; thick lines are the boundaries of
+the 7 super-clusters (Ward on the codebook vectors).
+
+```{r map-kohonen, fig.width = 11, fig.height = 6}
+sdv <- apply(feat_seg, 2, sd, na.rm = TRUE)
+Zs <- scale(feat_seg[, is.finite(sdv) & sdv > 0, drop = FALSE]); Zs[!is.finite(Zs)] <- 0
+set.seed(params$seed)
+koh <- kohonen::som(Zs, grid = kohonen::somgrid(params$som_xdim, params$som_ydim, "hexagonal"), rlen = 500, mode = "batch")
+K_koh <- nrow(koh$codes[[1]])
+tab_koh <- table(factor(koh$unit.classif, levels = seq_len(K_koh)), factor(seg_meta$class, levels = classes))
+major_koh <- ifelse(rowSums(tab_koh) > 0, classes[max.col(tab_koh, ties.method = "first")], NA)
+bg_koh <- rep("grey95", K_koh); bg_koh[!is.na(major_koh)] <- adjustcolor(pal[major_koh[!is.na(major_koh)]], 0.3)
+super_koh <- super_clusters(as.matrix(dist(koh$codes[[1]])), length(classes))
+cat(sprintf("%d segments x %d features; ARI(units, task) = %.3f; ARI(super-clusters, task) = %.3f\n",
+            nrow(Zs), ncol(Zs), ari(seg_meta$class, koh$unit.classif), ari(seg_meta$class, super_koh[koh$unit.classif])))
+
+layout(matrix(c(1, 2, 3, 3), 2, byrow = TRUE), heights = c(6, 1))
+op <- par(mar = c(0.5, 0.5, 2.5, 0.5))
+plot(koh, type = "mapping", pchs = 19, col = adjustcolor(pal[seg_meta$class], 0.85), bgcol = bg_koh,
+     shape = "straight", main = "Segments on the feature SOM")
+kohonen::add.cluster.boundaries(koh, super_koh, lwd = 3)
+plot(koh, type = "dist.neighbours", shape = "straight", main = "U-matrix (feature space)",
+     palette.name = function(n) hcl.colors(n, "Inferno", rev = TRUE))
+par(mar = c(0, 0, 0, 0)); plot.new()
+legend("center", legend = classes, pch = 19, col = pal, horiz = TRUE, bty = "n", cex = 0.95)
+par(op); layout(1)
+```
+
+**Component planes** of the most important XGBoost features: where on the map each feature is high.
+
+```{r map-kohonen-planes, fig.width = 11, fig.height = 7}
+top_f <- head(intersect(imp$Feature, colnames(Zs)), 6)
+op <- par(mfrow = c(2, 3), mar = c(0.5, 0.5, 2.5, 0.5))
+for (fn in top_f) plot(koh, type = "property", property = koh$codes[[1]][, fn], main = fn, shape = "straight",
+                       palette.name = function(n) hcl.colors(n, "viridis"))
+par(op)
+```
+
+```{r map-kohonen-training, fig.width = 10, fig.height = 4.5}
+op <- par(mfrow = c(1, 2), mar = c(1, 1, 3, 1))
+plot(koh, type = "counts", shape = "straight", main = "hits per unit", palette.name = function(n) hcl.colors(n, "YlGnBu", rev = TRUE))
+par(mar = c(4, 4, 3, 1)); plot(koh, type = "changes", main = "training progress")
+par(op)
+```
+
+# 8. Next steps
+
+* Run with `quick: false`, `k_folds: 9`, `repeats: 5` for the full protocol (hours with DTW-SOM and Mantis on).
+* Learning curve: repeat the loop with 9, 18, 36, 72 training children and plot accuracy per method.
+* Embedding fusion: concatenate Mantis embeddings with the RQA + catch22 matrix before the random forest.
+* `chaosrcpp`: automatic `tau` (average mutual information) and `m` (false nearest neighbours) for the
+  magnitude channels, cross-RQA between accelerometer and gyroscope, the 0-1 test for chaos.
+* `dtwsom`: a `map_units_to_labels()` helper (the logic of `unit_to_class()` above), an LB_Keogh
+  lower bound, and a class-coloured variant of `plot_members()`.
+
+```{r session}
+sessionInfo()
+```
