@@ -13,6 +13,7 @@ and alternatives to that pipeline, every model judged on children it has never s
 |---|---|
 | [`som_variants.Rmd`](som_variants.Rmd), **[interactive report](https://andrii-patrikei.github.io/movement_classification_v2026/)** | the article's features and pipeline with a **robust SOM**: 8.2 points more accurate on children the map has never seen |
 | [`movement_alternatives.Rmd`](movement_alternatives.Rmd) | DTW-SOM, RQA + catch22, MiniRocket and Mantis next to the article's approach |
+| [`supersom.Rmd`](supersom.Rmd), **[interactive report](https://andrii-patrikei.github.io/movement_classification_v2026/supersom.html)** | layered (SuperSOM), growing and DTW maps: no more accurate than the best single map, but they recognise children whose gyroscope failed |
 
 ## A robust SOM for the article's pipeline
 
@@ -81,6 +82,28 @@ install.packages(c("Rcpp", "kohonen", "aweSOM", "cluster", "data.table", "ggplot
 
 Needs a C++17 compiler (Rtools on Windows). `novel_som/` holds `ns_core.cpp` and `ns_maps.R` from novel_SOM
 (commit 2ae89c5) with one addition: an optional bubble neighbourhood, the one kohonen uses.
+
+## Layered maps (SuperSOM)
+
+`supersom.Rmd` tests whether one map trained on several layers at once (`kohonen::supersom`: the article's four
+feature sets, plus three curves from the raw signal compared with DTW), growing or fixed, with fixed, learned or
+chosen layer weights, beats the best single map. The core (`supersom/ss_core.cpp`) reproduces `kohonen::som` and
+`kohonen::supersom` bit for bit; 28 maps, 10 seeds, children held out, the winner confirmed on 20 fresh seeds.
+
+- **Not more accurate:** the best layered map (layers chosen on the training children) reaches 0.941 on held-out
+  children under the article's rule against 0.963 for the robust SOM on Mix, and stays just below the spectral map when
+  each unit names its task (0.976 against 0.979; lower on 16 of 20 fresh seeds). The four feature sets as equal layers
+  fall to 0.83: the weak RQA layer blurs the 7 super-clusters, although the units stay nearly as pure.
+- **Useful when a sensor is missing:** trained on all seven layers and fed only the accelerometer curves, the map
+  recognises the 9 children the article dropped (their gyroscope failed) at 0.867, against 0.767 for the best map
+  trained on the accelerometer alone (better on 10 of 10 seeds; these children were in no step of the feature selection).
+- **Growing adds no accuracy, and DTW lowers the layered maps** (it helps a single posture-curve map). Literature check:
+  a growing layered map is published in kernel form (a growing multiple-kernel GSOM, Wijewardena et al. 2015); in
+  kohonen's form, with DTW and Manhattan layers and medoid births, it was not found. Learned layer weights, DTW layers
+  (the `sits` package) and growth with DTW (GSOM Sequence, 2011) are published.
+
+`Rscript run_supersom.R` trains every map (about 2 hours on 17 cores) into `supersom/results/`; then knit
+`supersom.Rmd` (a few minutes). `Rscript supersom/tests/test_core.R` checks the core against kohonen.
 
 ## Alternatives to the pipeline
 
