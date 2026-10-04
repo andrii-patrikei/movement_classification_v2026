@@ -1,0 +1,623 @@
+---
+title: "SuperSOM: layered, growing and DTW maps"
+subtitle: "Does a layered SOM recognise children's movement tasks better than the best single map? The data and pipeline of Patrikei et al. (2026), *Acta Gymnica*: 28 maps, 10 seeds, children held out"
+author: "Andrii Patrikei"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: false
+    toc_depth: 2
+    code_folding: hide
+    theme: flatly
+    highlight: tango
+params:
+  quick: false     # TRUE = 2 seeds and 2 passes, to test the document in minutes (results in supersom/results_quick/)
+  cores: 0         # 0 = all but two; used only when supersom/results/ lacks a part of the plan
+---
+
+```{css, echo = FALSE}
+.main-container { max-width: 1120px; }
+body { font-size: 16px; line-height: 1.62; color: #1d1d1b; }
+h1.title { font-size: 34px; margin-top: 18px; }
+h3.subtitle { font-size: 19px; color: #52514e; line-height: 1.4; }
+h1 { font-size: 26px; margin-top: 44px; } h2 { font-size: 20px; margin-top: 30px; }
+.lead { font-size: 18px; line-height: 1.6; }
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 14px; margin: 22px 0 10px; }
+.tile { border: 1px solid #e6e5e0; border-left: 4px solid #2a78d6; border-radius: 6px; padding: 12px 16px; background: #fcfcfb; }
+.tile.yes { border-left-color: #1baf7a; }
+.tile.no { border-left-color: #eb6834; }
+.tile .num { font-size: 30px; font-weight: 700; line-height: 1.15; color: #0b0b0b; }
+.tile .lbl { font-size: 14px; color: #1d1d1b; margin-top: 4px; }
+.tile .sub { font-size: 13px; color: #52514e; margin-top: 2px; }
+.callout { border-left: 4px solid #2a78d6; background: #f3f7fd; padding: 12px 18px; margin: 18px 0 22px; border-radius: 0 6px 6px 0; }
+.callout p:last-child, .callout ul:last-child { margin-bottom: 0; }
+.note { color: #52514e; font-size: 14px; }
+table { font-size: 14px; }
+.table > thead > tr > th, .table > tbody > tr > td { padding: 5px 9px; }
+details summary { cursor: pointer; color: #2a78d6; margin: 8px 0; }
+pre code { font-size: 13px; }
+span.math.display { display: block; overflow-x: auto; overflow-y: hidden; }
+.diagram { margin: 10px 0 18px; }
+.diagram svg { width: 100%; max-width: 980px; height: auto; display: block; margin: 0 auto; }
+.diagram text { font-family: Lato, "Helvetica Neue", Helvetica, Arial, sans-serif; }
+```
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, comment = "#>", fig.align = "center", dpi = 110)
+library(data.table)
+for (f in c("R/article_metrics.R", "R/som_fits.R", "R/protocols.R", "R/plots.R", "R/plots_interactive.R",
+            file.path("supersom", "R", c("ss_maps.R", "ss_protocols.R", "ss_bench.R", "ss_raw.R", "ss_report.R")))) source(f)
+load_ss_core()
+cores <- if (params$cores > 0) params$cores else max(1L, parallel::detectCores() - 2L)
+quick <- isTRUE(params$quick); res_dir <- file.path("supersom", if (quick) "results_quick" else "results")
+```
+
+```{r load, include = FALSE}
+prepare_ss_cache()                                        # the article's matrices and the raw curves (built once)
+S <- ss_data(rlen = if (quick) 2L else 1000L)
+plan <- if (quick) ss_plan(1:2, 1:2) else ss_plan()
+res <- ss_compute(S, plan, cores, res_dir)
+for (p in names(res)) if (!is.null(attr(res[[p]], "failed"))) stop("failed jobs in ", p)
+stopifnot(nrow(res$all) == nrow(plan$all), nrow(res$heldout) == 648 * nrow(plan$heldout))
+WIN <- pick_winners(res$heldout)
+CF <- ss_compute(S, ss_plan_confirm(res, if (quick) 101:102 else 101:120), cores, res_dir)$confirm
+LNN_all <- ss_cached("layer_nn", ss_key("layer 1-NN", S$md5, "with predictions"), function() layer_nn(S), res_dir)
+LNN <- LNN_all$tab; wrong <- sapply(LNN_all$pred, function(p) p != S$y7)
+```
+
+```{r analysis, include = FALSE}
+mt <- method_table()
+lab <- setNames(mt$label, mt$method); grp <- setNames(mt$group, mt$method)
+H <- with_votes(res$heldout)
+Sd <- seed_scores(H)
+RULES <- c("super", "unit", "vote")
+RULE_LAB <- c(super = "held-out children, the article's rule (7 super-clusters)", unit = "held-out children, each unit names its task",
+              vote = "held-out children, the layers vote")
+SM <- summarise_seeds(Sd, c(RULES, "super_bacc", "unit_bacc", "acc_only_unit", "acc_only_super"))
+num <- setdiff(names(res$all)[vapply(res$all, is.numeric, TRUE)], "seed")
+AS <- res$all[, lapply(.SD, mean), by = method, .SDcols = num]
+mn <- function(m, me) SM[method == m & measure == me]$mean
+al <- function(m, me) AS[method == m][[me]]
+f3 <- function(x) sprintf("%.3f", x); pts <- function(x) sprintf("%+.1f", 100 * x); pt1 <- function(x) sprintf("%.1f", 100 * abs(x))
+n_seeds <- uniqueN(res$heldout$seed); n_all <- uniqueN(res$all$seed); n_conf <- uniqueN(CF$seed); n_children <- uniqueN(S$child)
+
+# the rule fixed in advance: the best unsupervised layered map and the best one-layer map, by the mean held-out
+# accuracy under each rule (screening seeds); then both again on fresh seeds
+L_S <- WIN$layered_super; L_U <- WIN$layered_unit; O_S <- WIN$single_super; O_U <- WIN$single_unit
+
+# B minus A, seed by seed (the same seeds give the same folds of children): mean, paired t interval, seeds better
+paired <- function(a, b, me, D = Sd) {
+  x <- merge(D[method == a, .(seed, va = get(me))], D[method == b, .(seed, vb = get(me))], by = "seed"); d <- x$vb - x$va
+  ci <- if (nrow(x) > 2 && sd(d) > 0) t.test(d)$conf.int else c(mean(d), mean(d))
+  list(diff = mean(d), lo = ci[1], hi = ci[2], better = sum(d > 0), worse = sum(d < 0), seeds = nrow(x))
+}
+ps <- paired(O_S, L_S, "super"); pu <- paired(O_U, L_U, "unit")
+p_glue <- paired("ss_classic_F4", "glue_classic_F4", "super"); p_agree <- paired("ss_rob_F4", "ss_rob_F4_agree", "super")
+p_rob <- paired("ss_classic_F4", "ss_rob_F4", "super"); p_sel <- paired("ss_sel7", "ss_sel7_euc", "super")
+p_dtw1 <- paired("euc_posture", "dtw_posture", "unit"); p_dtw3 <- paired("ss_R3_euc", "ss_R3_dtw", "unit")
+p_sep <- paired("rob_spectr", "vote_sep7", "unit")
+
+# the confirmation on fresh seeds: per child, the mean held-out accuracy over the seeds
+CFs <- CF[, .(super = mean(pred_super == y7), unit = mean(pred_unit == y7)), by = .(method, child)]
+child_cmp <- function(a, b, rule) {
+  x <- merge(CFs[method == a, .(child, a = get(rule))], CFs[method == b, .(child, b = get(rule))], by = "child"); d <- x$b - x$a
+  set.seed(1); boot <- replicate(10000, mean(sample(d, replace = TRUE)))
+  p <- if (any(d != 0)) suppressWarnings(wilcox.test(x$b, x$a, paired = TRUE, exact = FALSE))$p.value else 1
+  list(x = x[, rule := rule], better = sum(d > 0), worse = sum(d < 0), equal = sum(d == 0), gain = mean(d),
+       lo = unname(quantile(boot, 0.025)), hi = unname(quantile(boot, 0.975)), p = p)
+}
+cs <- child_cmp(O_S, L_S, "super"); cu <- child_cmp(O_U, L_U, "unit"); ck <- child_cmp("kohonen_tsfresh", L_S, "super")
+conf <- CF[, .(super = mean(pred_super == y7), unit = mean(pred_unit == y7)), by = .(method, seed)][, .(super = mean(super), unit = mean(unit)), by = method]
+cfm <- function(m, r) conf[method == m][[r]]
+
+# a sensor goes missing: the 9 children without a gyroscope (all-data maps), and the held-out children mapped with the
+# accelerometer curves only; "all7" = the three maps trained on all seven layers, "acc" = the best map trained on
+# accelerometer curves alone (by its own held-out accuracy)
+ALL7 <- c("ss_all7", "ss_all7_agree", "gss_all7")
+ACC_ONLY <- c("dtw_posture", "euc_posture", "dtw_accspec", "ss_A2_dtw")
+NG <- res$all[!is.na(nogyro9_unit), .(method, seed, nogyro9 = nogyro9_unit)]
+best_acc <- ACC_ONLY[which.max(sapply(ACC_ONLY, mn, me = "unit"))]
+ng_mean <- NG[, .(v = mean(nogyro9)), by = method]; ngm <- function(m) ng_mean[method == m]$v
+p_ng <- lapply(setNames(ALL7, ALL7), function(m) paired(best_acc, m, "nogyro9", NG))
+accH <- H[method %in% c(ALL7, best_acc), .(v = if (method[1] %in% ALL7) mean(!is.na(acc_unit) & acc_unit == y7) else mean(pred_unit == y7)), by = .(method, child)]
+acc_child <- function(m) { x <- merge(accH[method == best_acc, .(child, a = v)], accH[method == m, .(child, b = v)], by = "child"); d <- x$b - x$a
+  list(better = sum(d > 0), worse = sum(d < 0), p = suppressWarnings(wilcox.test(x$b, x$a, paired = TRUE, exact = FALSE))$p.value) }
+ac7 <- acc_child("ss_all7")
+
+# growing against fixed, the same layers and seeds (all data)
+GF <- rbindlist(lapply(list(c("ss_rob_F4", "gss_rob_F4"), c("ss_R3_dtw", "gss_R3_dtw"), c("ss_all7", "gss_all7"), c("ss_sel7", "gss_sel7")), function(p) {
+  x <- merge(res$all[method == p[1]], res$all[method == p[2]], by = "seed", suffixes = c("_f", "_g"))
+  hs <- paired(p[1], p[2], "super"); hu <- paired(p[1], p[2], "unit")
+  data.table(fixed = p[1], growing = p[2], te_f = mean(x$TE_own_f), te_g = mean(x$TE_own_g), te_lower = sum(x$TE_own_g < x$TE_own_f),
+             tp_f = mean(x$TP_f), tp_g = mean(x$TP_g), qe_f = mean(x$QE_own_f), qe_g = mean(x$QE_own_g), sec_f = mean(x$seconds_f), sec_g = mean(x$seconds_g),
+             ho_super = hs$diff, ho_super_better = hs$better, ho_unit = hu$diff, seeds = nrow(x))
+}))
+sv <- range(1 - GF$sec_g / GF$sec_f); speed <- sprintf("%.0f to %.0f%%", 100 * sv[1], 100 * sv[2])
+
+# fresh seeds, seed by seed (the paired test of the screening, on seeds 101-120)
+CFseed <- CF[, .(super = mean(pred_super == y7), unit = mean(pred_unit == y7)), by = .(method, seed)]
+pcu <- paired(O_U, L_U, "unit", CFseed); pcs <- paired(O_S, L_S, "super", CFseed)
+# which layers the folds of the pre-set winner kept: "spectr x4; spectr+tsfresh x2; ..." per seed
+fold_sets <- function(D, m) {
+  x <- unique(D[method == m, .(seed, layers)])
+  rbindlist(lapply(x$layers, function(l) rbindlist(lapply(strsplit(l, "; ")[[1]], function(p) {
+    s2 <- strsplit(p, " x")[[1]]; data.table(set = s2[1], n = as.integer(s2[2])) }))))[, .(n = sum(n)), by = set]
+}
+fs_h <- fold_sets(res$heldout, L_S); fs_c <- fold_sets(CF, L_S)
+alone_h <- fs_h[set == "spectr", sum(n)]; alone_c <- fs_c[set == "spectr", sum(n)]
+nlay <- function(fs) fs[, .(k = lengths(strsplit(set, "+", fixed = TRUE)), n)][, .(n = sum(n)), by = k]
+nl_dtw <- nlay(fold_sets(res$heldout, "ss_sel7")); dtw_12 <- nl_dtw[k %in% 2:3, sum(n)]
+# DTW against sum of squares, the same layers
+p_dtw1s <- paired("euc_posture", "dtw_posture", "super"); p_dtw_sel <- paired("ss_sel7_euc", "ss_sel7", "super")
+p_adapt <- paired("ss_rob_F4", "ss_rob_F4_adapt", "super")
+# the agreement weights: RQA's weight at the end against kohonen's start weight (the same start rows, seed by seed)
+wnum <- function(m) { x <- res$all[method == m, .(seed, w)]; x[, rqa := as.numeric(sapply(strsplit(w, " "), `[`, 1))]; x[, .(seed, rqa)] }
+wr <- merge(wnum("ss_rob_F4"), wnum("ss_rob_F4_agree"), by = "seed", suffixes = c("_0", "_1"))[, rel := rqa_1 / rqa_0 - 1]
+# the layer vote against the unit rule, layered maps
+vu <- dcast(SM[measure %in% c("vote", "unit") & method %in% mt[!group %in% c("single", "separate")]$method], method ~ measure, value.var = "mean")[, d := vote - unit]
+# the floating radius under the bubble neighbourhood: the same growing map with it switched off
+g4 <- SS_METHODS[["gss_rob_F4"]]
+float_diff <- max(sapply(1:2, function(sd) max(abs(fit_ss(S$XL, g4, sd, rlen = S$rlen)$M - fit_ss(S$XL, modifyList(g4, list(float = 0)), sd, rlen = S$rlen)$M))))
+```
+
+<p class="lead">
+A SuperSOM (<code>kohonen::supersom</code>) trains <b>one</b> map on several blocks of data at once, the "layers": every
+layer keeps its own distance and weight, and the winning unit is the one closest over all of them. Here every version
+of it was built from the best ingredients of the earlier reports (the robust Manhattan SOM, the DTW-SOM, the growing
+DTW-SOM of Step 12) and tested the way <code>som_variants.Rmd</code> tested the single maps: the article's 648 segments,
+its 5&times;5 map and 7 super-clusters, children the map has never seen, `r n_seeds` seeds, and a confirmation on
+`r n_conf` fresh seeds.
+</p>
+
+<div class="tiles">
+<div class="tile no"><div class="num">`r pts(ps$diff)` points</div>
+<div class="lbl">best layered map against the best single map, held-out children, the article's rule</div>
+<div class="sub">`r f3(mn(L_S, "super"))` against `r f3(mn(O_S, "super"))`; worse on `r ps$worse` of `r ps$seeds` seeds; fresh seeds: `r cs$worse` children worse, `r cs$better` better</div></div>
+<div class="tile no"><div class="num">`r pts(pu$diff)` points</div>
+<div class="lbl">the same, when each unit names its task</div>
+<div class="sub">`r f3(mn(L_U, "unit"))` against `r f3(mn(O_U, "unit"))`; small but real: lower on `r pcu$worse` of `r pcu$seeds` fresh seeds (interval `r pts(pcu$lo)` to `r pts(pcu$hi)`)</div></div>
+<div class="tile yes"><div class="num">`r pts(ngm("ss_all7") - ngm(best_acc))` points</div>
+<div class="lbl">the 9 children the article dropped (gyroscope failed), recognised from the accelerometer alone</div>
+<div class="sub">`r f3(ngm("ss_all7"))` with a map trained on all 7 layers, `r f3(ngm(best_acc))` with the best accelerometer-only map; better on `r p_ng$ss_all7$better` of `r p_ng$ss_all7$seeds` seeds</div></div>
+<div class="tile"><div class="num">partly new</div>
+<div class="lbl">a layered map whose lattice grows during training</div>
+<div class="sub">kernel form published (a growing multiple-kernel GSOM, Wijewardena et al. 2015); kohonen's form with DTW and Manhattan layers and medoid births: not found</div></div>
+</div>
+
+<div class="callout">
+
+**Does it work?**
+
+* **For the article's question, no.** With every sensor available, the best single feature set on the robust SOM
+  (`r lab[[O_S]]`, `r f3(mn(O_S, "super"))`; `r lab[[O_U]]`, `r f3(mn(O_U, "unit"))` when each unit names its task) stays
+  ahead of every layered map. Layering the article's four feature sets costs
+  `r pt1(mn("ss_rob_F4", "super") - mn("rob_spectr", "super"))` points against the spectral map alone; letting each fold choose its own layers wins most of it
+  back (`r f3(mn(L_S, "super"))`) but does not overtake.
+* **Where it works: a missing sensor.** A map trained on all seven layers and fed only the accelerometer curves recognises
+  `r f3(ngm("ss_all7"))` of the segments of the 9 children whose gyroscope failed, against `r f3(ngm(best_acc))` for the best map
+  trained on the accelerometer curves alone. Only a layered map can do this: train with everything, map with what you have.
+* **Growing adds nothing to the accuracy, and DTW costs some in layered maps.** The growing map reaches the same accuracy,
+  is `r speed` faster and less well ordered. DTW lifts a single posture-curve map (`r pts(p_dtw1$diff)` points when each unit
+  names its task, `r pts(p_dtw1s$diff)` under the article's rule) but lowers the layered maps: `r pts(p_dtw3$diff)` points for the
+  three raw curves (`r p_dtw3$worse` of `r p_dtw3$seeds` seeds), `r pts(p_dtw_sel$diff)` for the layer-choosing map.
+
+</div>
+
+# 1. What a SuperSOM is
+
+<div class="diagram">
+<svg viewBox="0 0 980 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Seven layers, each with its own distance, summed with weights; the unit with the smallest sum wins on one hexagonal map">
+<g font-size="13" fill="#1d1d1b">
+<text x="10" y="18" font-weight="700" fill="#52514e">one segment, seven layers</text>
+<g stroke="#e6e5e0" stroke-width="1.5">
+<rect x="10" y="30" width="250" height="28" rx="4" fill="#fdeee8"/><rect x="10" y="62" width="250" height="28" rx="4" fill="#fdeee8"/>
+<rect x="10" y="94" width="250" height="28" rx="4" fill="#fdeee8"/><rect x="10" y="126" width="250" height="28" rx="4" fill="#fdeee8"/>
+<rect x="10" y="168" width="250" height="28" rx="4" fill="#e6f6ef"/><rect x="10" y="200" width="250" height="28" rx="4" fill="#e6f6ef"/>
+<rect x="10" y="232" width="250" height="28" rx="4" fill="#e6f6ef"/></g>
+<text x="20" y="49">RQA features (27)</text><text x="20" y="81">Autocorrelation features (27)</text>
+<text x="20" y="113">Spectral features (27)</text><text x="20" y="145">tsfresh features (27)</text>
+<text x="20" y="187">Posture curve (3 axes x 64)</text><text x="20" y="219">Accelerometer spectrum (3 x 40)</text>
+<text x="20" y="251">Gyroscope spectrum (3 x 40)</text>
+<text x="270" y="95" fill="#52514e">Manhattan, clipped pull</text><text x="270" y="219" fill="#52514e">DTW, warped pull</text>
+<g stroke="#52514e" stroke-width="1.2" fill="none"><path d="M262 44 L430 148"/><path d="M262 76 L430 148"/><path d="M262 108 L430 148"/><path d="M262 140 L430 148"/>
+<path d="M262 182 L430 148"/><path d="M262 214 L430 148"/><path d="M262 246 L430 148"/></g>
+<circle cx="470" cy="148" r="40" fill="#fcfcfb" stroke="#2a78d6" stroke-width="2"/>
+<text x="470" y="144" text-anchor="middle" font-size="15">&#931; w&#8343; d&#8343;</text><text x="470" y="163" text-anchor="middle" font-size="11" fill="#52514e">weighted sum</text>
+<path d="M512 148 L600 148" stroke="#52514e" stroke-width="1.5" marker-end="url(#ar)"/>
+<defs><marker id="ar" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#52514e"/></marker></defs>
+<text x="520" y="138" font-size="11" fill="#52514e">smallest wins</text>
+<g stroke="#ffffff" stroke-width="2" fill="#dfe9f7">
+<polygon points="640,96 657,86 674,96 674,116 657,126 640,116"/><polygon points="674,96 691,86 708,96 708,116 691,126 674,116"/>
+<polygon points="708,96 725,86 742,96 742,116 725,126 708,116"/><polygon points="657,126 674,116 691,126 691,146 674,156 657,146"/>
+<polygon points="691,126 708,116 725,126 725,146 708,156 691,146" fill="#2a78d6"/><polygon points="725,126 742,116 759,126 759,146 742,156 725,146"/>
+<polygon points="640,156 657,146 674,156 674,176 657,186 640,176"/><polygon points="674,156 691,146 708,156 708,176 691,186 674,176"/>
+<polygon points="708,156 725,146 742,156 742,176 725,186 708,176"/><polygon points="657,186 674,176 691,186 691,206 674,216 657,206"/>
+<polygon points="691,186 708,176 725,186 725,206 708,216 691,206"/><polygon points="725,186 742,176 759,186 759,206 742,216 725,206"/></g>
+<text x="640" y="240" fill="#52514e">one map: every unit has a prototype</text><text x="640" y="256" fill="#52514e">in every layer</text>
+<text x="790" y="110" font-size="12" fill="#52514e">the winner and its</text><text x="790" y="126" font-size="12" fill="#52514e">neighbours move toward</text>
+<text x="790" y="142" font-size="12" fill="#52514e">the segment, every layer</text><text x="790" y="158" font-size="12" fill="#52514e">by its own pull</text>
+</g></svg>
+</div>
+
+$$c(\mathbf{x}) = \arg\min_k \sum_{l} w_l\, d_l(\mathbf{x}_l, \mathbf{m}_{k,l}), \qquad \mathbf{m}_{j,l} \leftarrow \mathbf{m}_{j,l} + \alpha(t)\, h_{cj}(t)\, \Delta_l(\mathbf{x}_l, \mathbf{m}_{j,l})$$
+
+Each layer $l$ has its own distance $d_l$, its own weight $w_l$ and its own pull $\Delta_l$. By default, as in kohonen, the
+weights make every layer count the same on average: $w_l \propto 1/\bar d_l$, with $\bar d_l$ the mean distance between the
+starting units in layer $l$. The new compiled core (`supersom/ss_core.cpp`) is checked against kohonen itself:
+
+```{r identity, echo = FALSE}
+chk1 <- sapply(1:3, function(sd) max(abs(fit_kohonen(unclass(S$XL$tsfresh), sd)$M - fit_ss(S$XL, ss_method("k", "", "tsfresh", "classic"), sd, rlen = S$rlen)$M)))
+F4l <- S$XL[F4]; set.seed(1); idx <- sample(648, 25, replace = TRUE)
+ks <- kohonen::supersom(lapply(F4l, unclass), grid = kohonen::somgrid(5, 5, "hexagonal"), rlen = S$rlen, alpha = c(0.05, 0.01),
+                        init = lapply(F4l, function(x) unclass(x)[idx, ]), dist.fcts = "sumofsquares", maxNA.fraction = 8)
+chk2 <- max(abs(do.call(cbind, ks$codes) - fit_ss(S$XL, ss_method("s", "", F4, "classic"), 1, rlen = S$rlen)$M))
+knitr::kable(data.frame(Check = c("One layer against kohonen::som (the article's call), seeds 1 to 3",
+                                  "Four layers against kohonen::supersom (sum of squares, kohonen's layer weights), seed 1"),
+                        `Largest difference between the codebooks` = c(max(chk1), chk2), check.names = FALSE))
+```
+
+Every map below is therefore an exact `kohonen::supersom` (with the article's random start rows passed as `init`) when
+its layers use kohonen's sum of squares, and the same loop with other distances, pulls, weights or a growing lattice
+otherwise. One consequence is worth knowing: with sum-of-squares layers a SuperSOM *is* a plain SOM on the layers glued
+side by side, each multiplied by $\sqrt{w_l}$ (winner and update alike). The plain glued table, every layer weighted the
+same, differs from the SuperSOM only by kohonen's layer weights, and by `r pts(p_glue$diff)` points on held-out children
+(`r p_glue$better` seeds better, `r p_glue$worse` worse): layers only matter when they bring their own distance, weight or pull.
+
+# 2. The layers
+
+The article's four feature sets (Mix, its fifth, is the first three together) and three curves built from the raw IMU
+signal (`supersom/R/ss_raw.R`), each on an axis where an elastic alignment means something: the trunk's posture over the
+course of the task, and the accelerometer and gyroscope spectra, along which DTW lets a child step faster or slower. How
+well each layer separates the tasks by itself, before any map (a segment takes the task of its nearest segment of
+another child):
+
+```{r layers, echo = FALSE}
+LNN_t <- LNN[, .(Layer = LAYER_LABELS[layer], What = ifelse(kind == "features", "the article's 27 features (top XGBoost gain, scaled)",
+                                                           c(posture = "accelerometer, low-passed, 64 points over the task",
+                                                             accspec = "log power, 0.25 to 10 Hz, 40 bins per axis",
+                                                             gyrospec = "log power, 0.25 to 10 Hz, 40 bins per axis")[layer]),
+                 Columns = columns, `Distance in the maps` = ifelse(kind == "features", "Manhattan", "DTW"),
+                 `1-NN, Euclidean` = euclid, `1-NN, own distance` = own)]
+knitr::kable(LNN_t, digits = 3, caption = "Leave-one-child-out 1-NN accuracy of every layer on its own")
+```
+
+Every layer carries the tasks, and the layers err on different segments: the spectral and tsfresh features are wrong
+on `r sum(wrong[, "spectr"])` and `r sum(wrong[, "tsfresh"])` segments, only `r sum(wrong[, "spectr"] & wrong[, "tsfresh"])` of them
+shared, and the posture curve gets `r sum(wrong[, "spectr"] & !wrong[, "posture"])` of the spectral errors right. So a
+combination could in principle beat the best layer. The question is whether one map can use that.
+
+# 3. The test
+
+| | Held fixed (the article's) | Changed |
+|---|---|---|
+| Data | 648 segments, 81 children, 7 tasks; the article's feature matrices | plus three raw curves |
+| Map | 5&times;5 units (the growing maps grow to 25), 1000 passes, bubble neighbourhood, learning rate 0.05 to 0.01 | the layers, their distances, weights, growth |
+| Clusters | 7 PAM super-clusters, each named after its majority task | PAM on the map's own distance (Euclidean for sum-of-squares maps, as the article) |
+| Judged | held-out children: 9 folds of 9 children, `r n_seeds` seeds; all data, `r n_all` seeds | plus unit majority, layer vote, a missing sensor |
+
+The 28 maps were fixed before the full run (after a pilot of three seeds on all data and one held-out seed). They fall
+into one-layer controls, layered maps of the four feature sets, of the three raw curves, of all seven layers, and of the
+layers each fold chooses for itself: a greedy forward selection by leave-one-child-out 1-NN accuracy, run on the 72
+training children of the fold only. The winner among the layered maps and the best one-layer map are picked by a rule
+fixed in advance (best mean held-out accuracy under each rule) and run again on `r n_conf` fresh seeds.
+
+<details><summary>The 28 maps</summary>
+
+```{r methods, echo = FALSE}
+MT <- mt[, .(Map = label, Group = GROUPS[group], Layers = gsub("\\+", " + ", layers), Grows = ifelse(grow, "yes", ""))]
+dt_table(MT, page = 30, filter = "none")
+```
+
+</details>
+
+# 4. The verdict
+
+```{r verdict, echo = FALSE}
+p_verdict(SM, mt, RULES, RULE_LAB, c("Article's rule (7 super-clusters)", "Each unit names its task", "The layers vote"))
+```
+
+<p class="note">Dots: the mean over `r n_seeds` seeds; whiskers: the range of the seeds. The dashed line is the best
+one-layer map under the chosen rule; hover a dot for the gain against it. The buttons switch the rule and re-sort the maps.
+"The layers vote": every layer of a layered map finds its own nearest unit and the units' tasks vote.</p>
+
+* **No layered map beats the best one-layer map** under any rule. The pre-set winner among the layered maps is
+  `r lab[[L_S]]`: `r f3(mn(L_S, "super"))` on held-out children under the article's rule, `r pts(ps$diff)` points against
+  `r lab[[O_S]]` (95% interval `r pts(ps$lo)` to `r pts(ps$hi)`, worse on `r ps$worse` of `r ps$seeds` seeds); each unit
+  naming its task, `r f3(mn(L_U, "unit"))` against `r f3(mn(O_U, "unit"))` (`r pts(pu$diff)`, interval `r pts(pu$lo)` to `r pts(pu$hi)`).
+* **The four feature sets together are worse than the best of them**: `r f3(mn("ss_rob_F4", "super"))` for the robust
+  SuperSOM, `r f3(mn("ss_classic_F4", "super"))` for `kohonen::supersom`. The robust layers help
+  (`r pts(p_rob$diff)` points), learned agreement weights a little more (`r pts(p_agree$diff)`, `r p_agree$better` of `r p_agree$seeds` seeds),
+  and the inverse-error weights tend to make it worse (`r f3(mn("ss_rob_F4_adapt", "super"))`, `r pts(p_adapt$diff)` points,
+  interval `r pts(p_adapt$lo)` to `r pts(p_adapt$hi)`).
+* **Voting does not rescue it either**: the layer vote lifts a layered map a little above its unit rule (at most
+  `r pts(max(vu$d))` points) but never above the spectral map alone, and seven separate one-layer maps voting reach
+  `r f3(mn("vote_sep7", "unit"))` against `r f3(mn("rob_spectr", "unit"))`.
+
+<details><summary>Every map and every measure (sortable, searchable, downloadable)</summary>
+
+```{r leaderboard, echo = FALSE}
+wide <- dcast(SM[measure %in% c(RULES, "super_bacc", "acc_only_unit")], method ~ measure, value.var = "mean")
+lb <- merge(merge(mt, wide, by = "method", all.x = TRUE), AS, by = "method", all.x = TRUE)[order(-super)]
+LB <- lb[, .(Map = label, Group = GROUPS[group], `Held-out, super-clusters` = super, `Held-out, units` = unit, `Held-out, layer vote` = vote,
+             `Held-out, balanced` = super_bacc, `Held-out, accelerometer only` = acc_only_unit, `All data, super-clusters` = accuracy,
+             `All data, units` = unit_acc_in, ARI = ari_super, NMI = nmi_super, Purity = purity, `QE (own)` = QE_own, `TE (own)` = TE_own,
+             `Topographic product` = TP, `9 children, no gyroscope` = nogyro9_unit, `Seconds per map` = seconds)]
+dt_table(LB, round_cols = names(LB)[3:ncol(LB)], page = 30)
+```
+
+<p class="note">All-data measures: one map on all 648 segments, `r n_all` seeds. QE and TE in the map's own weighted
+distance (comparable only between maps on the same layers); the topographic product (Bauer &amp; Pawelzik) on the
+prototypes against the lattice; ARI and NMI of the 7 super-clusters against the tasks; purity: the share of segments in
+the majority task of their unit. Held-out, balanced: every task weighs the same (crawling has twice the segments).</p>
+
+</details>
+
+# 5. Why layering loses
+
+```{r purity, echo = FALSE}
+p_purity_vs_super(AS, mt)
+```
+
+<p class="note">Every dot one map, the mean over `r n_all` seeds on all 648 segments.</p>
+
+The units of the layered feature-set maps are nearly as pure as those of the best one-layer map (right side of the chart):
+when every unit names its task, the four-set SuperSOM gets `r f3(al("ss_rob_F4", "unit_acc_in"))` of the segments right,
+the spectral map `r f3(al("rob_spectr", "unit_acc_in"))`. What breaks is the
+step the article adds on top, the 7 super-clusters: PAM groups the 25 prototypes by their distances, and in a layered map
+those distances are the weighted sum over all layers. A weak layer counts as much as a strong one (that is what the
+default weights do), so RQA, the weakest layer (1-NN `r f3(LNN[layer == "rqa"]$own)`; its own map `r f3(mn("rob_rqa", "unit"))` of the held-out
+segments when each unit names its task, `r f3(mn("rob_rqa", "super"))` under the article's rule), blurs the
+distances between the prototypes of different tasks. Choosing the layers per fold removes the weak ones. The folds always keep the spectral features; with DTW curves they
+mostly add one or two more layers (`r dtw_12` of `r 9 * n_seeds` folds), while the pre-set winner (curves by sum of
+squares) kept the spectral features *alone* in `r alone_h` of `r 9 * n_seeds` folds, where it simply is the spectral
+one-layer map:
+
+```{r chosen, echo = FALSE}
+ch <- unique(res$heldout[method %in% c("ss_sel7", "ss_sel7_euc"), .(method, seed, layers)])
+cnt <- rbindlist(lapply(seq_len(nrow(ch)), function(i) {
+  parts <- strsplit(ch$layers[i], "; ")[[1]]
+  rbindlist(lapply(parts, function(p) { s <- strsplit(p, " x")[[1]]; data.table(method = ch$method[i], set = s[1], n = as.integer(s[2])) }))
+}))
+cnt <- cnt[, .(folds = sum(n)), by = .(method, set)]
+cnt[, share := folds / sum(folds), by = method]
+layer_share <- rbindlist(lapply(POOL7, function(l) cnt[, .(layer = l, share = sum(share[grepl(paste0("(^|\\+)", l, "(\\+|$)"), set)])), by = method]))
+knitr::kable(dcast(layer_share, layer ~ method, value.var = "share")[match(POOL7, layer)][, layer := LAYER_LABELS[layer]],
+             digits = 2, col.names = c("Layer", "chosen, curves with DTW", "chosen, curves by sum of squares"),
+             caption = sprintf("Share of the %d folds (%d seeds x 9) whose training children chose each layer", 9 * n_seeds, n_seeds))
+```
+
+<details><summary>How the learned weights move</summary>
+
+```{r weights, echo = FALSE}
+WTr <- ss_cached("weight_trace", ss_key("weight trace", S$md5, S$rlen), function() rbindlist(lapply(c("ss_rob_F4_agree", "ss_rob_F4_adapt"), function(id) {
+  f <- fit_ss(S$XL, SS_METHODS[[id]], 1, rlen = S$rlen, trace = TRUE); w <- f$w_trace
+  rbindlist(lapply(seq_along(F4), function(l) data.table(method = id, layer = F4[l], pass = w[, "step"] / 648, w = w[, l + 1])))
+})), res_dir)
+w0 <- as.numeric(strsplit(res$all[method == "ss_rob_F4" & seed == 1]$w, " ")[[1]])  # kohonen's start weights, seed 1
+WTr <- rbind(WTr, rbindlist(lapply(c("ss_rob_F4_agree", "ss_rob_F4_adapt"), function(id) data.table(method = id, layer = F4, pass = 0, w = w0))))[order(method, layer, pass)]
+p_weights(WTr, c(ss_rob_F4_agree = "agreement", ss_rob_F4_adapt = "inverse error"))
+```
+
+<p class="note">Seed 1, all data, the weights after every pass (pass 0: kohonen's start weights). Inverse error ($w_l \propto$ the layer's length over its
+mean distance to the winner, the maximum-likelihood noise scale) keeps RQA high: its features are correlated and easy to
+fit, and easy to fit is not the same as informative. Agreement ($w_l \propto w_l^0 / (1 + g_l)$, $g_l$ the mean lattice distance, over all segments, between the layer's own
+nearest unit and the winner, recomputed after every pass; a per-pass version of the running-mean rule of the novel_SOM branch
+`claude/loving-fermat-1wvts3`) moves weight away from RQA, mostly in the first pass: seed 1 from `r f3(wr$rqa_0[1])`
+(kohonen's start weight, pass 0) to `r f3(wr$rqa_1[1])`; `r sprintf("%.0f to %.0f%%", -100 * max(wr$rel), -100 * min(wr$rel))`
+less over the `r nrow(wr)` seeds.</p>
+
+</details>
+
+# 6. Fresh seeds, child by child
+
+The rule picked `r lab[[L_S]]` (layered) and `r lab[[O_S]]` / `r lab[[O_U]]` (one layer). On `r n_conf` fresh seeds (new
+starts, new orders, new folds of children), each child's held-out accuracy averaged over the seeds:
+
+```{r children, echo = FALSE}
+CCd <- rbind(cs$x, cu$x)
+p_child_bars(CCd, "one layer", "layered", c("super", "unit"), c(sprintf("Article's rule, against %s", lab[[O_S]]), sprintf("Unit rule, against %s", lab[[O_U]])),
+             c("Article's rule", "Each unit names its task"))
+```
+
+```{r children-table, echo = FALSE}
+ctab <- rbindlist(lapply(list(list(cs, O_S, "the article's rule"), list(cu, O_U, "each unit names its task"), list(ck, "kohonen_tsfresh", "the article's rule")), function(z)
+  data.table(Rule = z[[3]], `Against` = lab[[z[[2]]]], `Children better / worse / equal` = sprintf("%d / %d / %d", z[[1]]$better, z[[1]]$worse, z[[1]]$equal),
+             `Mean gain per child (points)` = sprintf("%s (%s to %s)", pts(z[[1]]$gain), pts(z[[1]]$lo), pts(z[[1]]$hi)),
+             `Wilcoxon p` = ifelse(z[[1]]$p < 1e-4, "< 0.0001", sprintf("%.4f", z[[1]]$p)))))
+knitr::kable(ctab, caption = sprintf("%s on %d fresh seeds, child by child (bootstrap interval over the %d children; paired Wilcoxon test)", lab[[L_S]], n_conf, n_children))
+```
+
+The fresh seeds repeat the screening: under the article's rule the layered map is `r f3(cfm(L_S, "super"))` against
+`r f3(cfm(O_S, "super"))`, worse for `r cs$worse` children and better for `r cs$better`. Each unit naming its task it is
+`r f3(cfm(L_U, "unit"))` against `r f3(cfm(O_U, "unit"))`: no difference child by child (p = `r sprintf("%.2f", cu$p)`), but lower
+on `r pcu$worse` of `r pcu$seeds` fresh seeds (`r pts(pcu$diff)` points, interval `r pts(pcu$lo)` to `r pts(pcu$hi)`), a small
+deficit rather than a tie. Part of the closeness is no contest at all: in `r alone_c` of the `r 9 * n_conf` fresh folds the
+training children chose the spectral features alone, and there the layered map *is* the spectral one-layer map. It does beat the article's own map
+(`kohonen::som` on tsfresh, `r f3(cfm("kohonen_tsfresh", "super"))`) for `r ck$better` children against `r ck$worse`, but so does
+the robust one-layer map of `som_variants.Rmd`.
+
+# 7. A sensor goes missing
+
+The article dropped 9 of its 90 children because their gyroscope recorded nothing. Their accelerometer is complete, so
+the posture curve and the accelerometer spectrum exist for them; the article's features (built from all six axes) and the
+gyroscope spectrum do not. A layered map can still place such a child: it finds the winner with the layers the child has
+(kohonen's `whatmap`) and names it from the units, which were trained on everything.
+
+```{r missing, echo = FALSE}
+MS <- merge(merge(SM[measure == "unit", .(method, all_layers = mean)], SM[measure == "acc_only_unit", .(method, acc_only = mean)], by = "method"),
+            ng_mean[, .(method, nogyro9 = v)], by = "method")
+MS[, label := lab[method]]
+p_missing(MS)
+```
+
+<p class="note">Each unit names its task. Grey: held-out children with every layer the map has; aqua: the same children
+mapped with the accelerometer curves only, as if their gyroscope had failed; magenta: the 72 segments of the 9 real
+children without a gyroscope, mapped by maps trained on all 81 children. Means over `r n_seeds` seeds. A map whose fold
+chose no accelerometer curve cannot place a child without a gyroscope; those segments count as wrong (the low aqua dot of
+the layer-choosing map with curves by sum of squares).</p>
+
+* **The maps trained on all seven layers recognise the 9 dropped children best**: `r f3(ngm("ss_all7"))`,
+  `r f3(ngm("ss_all7_agree"))` with agreement weights and `r f3(ngm("gss_all7"))` growing, against `r f3(ngm(best_acc))` for the
+  best map trained on accelerometer curves alone (`r lab[[best_acc]]`): `r pts(p_ng$ss_all7$diff)` points, better on
+  `r p_ng$ss_all7$better` of `r p_ng$ss_all7$seeds` seeds (interval over the seeds `r pts(p_ng$ss_all7$lo)` to `r pts(p_ng$ss_all7$hi)`;
+  it covers the training runs on the same 72 segments, not other children). These 9 children were in no step of the
+  article's feature selection, and the maps are trained on the other 81.
+* **The simulation on the 81 children agrees**: mapped with the accelerometer curves only, the seven-layer map gets
+  `r f3(mn("ss_all7", "acc_only_unit"))` against `r f3(mn(best_acc, "unit"))`, better for `r ac7$better` children and worse for
+  `r ac7$worse` (paired Wilcoxon p = `r sprintf("%.3f", ac7$p)`). This comparison leans toward the seven-layer map: its
+  feature layers come from the article's XGBoost selection on all 81 children, labels included, which the raw-curve map
+  never uses. The 9 real children above are free of that.
+* Why: the units are cut by all the evidence, so the accelerometer prototypes of a unit belong to one task more cleanly
+  than in a map that only ever saw the accelerometer. The price is `r pt1(mn("ss_all7", "unit") - mn("ss_all7", "acc_only_unit"))` points
+  against the same map with every layer (`r f3(mn("ss_all7", "unit"))`).
+
+# 8. The growing map
+
+The growing maps are Step 12's growing DTW-SOM with the SuperSOM's distance: seven units to start, then a birth every
+`r round(0.6 * S$rlen / 18)` passes (`r format(round(0.6 * S$rlen * 648 / 18), big.mark = ",")` steps on all 648 segments)
+until 60% of the training, the radius held at one step while the map grows; each child is the medoid (a real segment, in
+every layer at once) of the half of its parent's segments that the parent fits worst; they end with 25 units, like the
+fixed maps. Step 12's floating radius is switched on but does nothing here: with kohonen's bubble neighbourhood on whole
+steps of the lattice, a radius between 1 and 2 moves the same units as a radius of 1 (with and without it, the growing
+map of the four feature sets ends with `r if (float_diff == 0) "identical codebooks" else sprintf("codebooks that differ by at most %.2g", float_diff)`, seeds 1 and 2).
+
+```{r growth, echo = FALSE}
+gm <- SS_METHODS[["gss_all7"]]
+G <- ss_cached("growth_trace", ss_key("growth trace", S$md5, S$rlen), function() {
+  g <- grow_traced(S$XL, gm, 1, rlen = S$rlen)
+  g$same_as_fit <- max(abs(g$final$M - fit_ss(S$XL, gm, 1, rlen = S$rlen)$M))
+  g
+}, res_dir)
+p_growth(G, S$y7, S$rlen * length(S$y7))
+```
+
+<p class="note">`r lab[["gss_all7"]]`, seed 1, all 648 segments. Every hexagon a unit, coloured by the task most of its
+segments belong to; the star marks the newborn unit. Press Play or drag the slider. The traced run is the same training
+as the benchmark's (largest difference between the final codebooks: `r G$same_as_fit`).</p>
+
+```{r grow-table, echo = FALSE}
+knitr::kable(GF[, .(Layers = lab[fixed], `TE fixed / growing` = sprintf("%.3f / %.3f", te_f, te_g), `Seeds with lower TE` = sprintf("%d of %d", te_lower, seeds),
+                    `Topographic product` = sprintf("%.3f / %.3f", tp_f, tp_g), `Seconds per map` = sprintf("%.1f / %.1f", sec_f, sec_g),
+                    `Held-out, super-clusters` = pts(ho_super), `Held-out, units` = pts(ho_unit))],
+             caption = "Growing against fixed, the same layers (all data for the map measures; held-out gains in points, growing minus fixed)")
+```
+
+Growing does not change the accuracy beyond the seed noise; it saves `r speed` of the time (fewer units to compare while it
+grows) and orders the map slightly *worse* on the article's schedule: TE higher on average in all four pairs, and on
+most seeds in `r sum(GF$te_lower < GF$seeds / 2)` of them. On the tutorial's
+Gaussian schedule the growing DTW-SOM ordered maps better (Step 12); with kohonen's bubble neighbourhood, whose radius
+drops to the winner alone right after the growth, that advantage does not carry over.
+
+# 9. The maps
+
+```{r map-fits, echo = FALSE}
+median_seed <- function(m) { x <- res$all[method == m]; x$seed[which.min(abs(x$accuracy - median(x$accuracy)))] }
+MP <- ss_cached("maps", ss_key("maps v2", S$md5, S$rlen), function() lapply(c(O_S, L_S, "gss_all7"), function(m) {
+  meth <- with_selection(SS_METHODS[[m]], S$XL, S$child, S$y7); sd <- median_seed(m)
+  f <- fit_ss(S$XL, meth, sd, rlen = S$rlen, y = S$y7); sup <- super_clusters_ss(f)
+  list(title = sprintf("%s (seed %d)", c(lab[[O_S]], "Layered: chosen layers", "Growing: all 7 layers")[match(m, c(O_S, L_S, "gss_all7"))], sd), pos = f$pos, bmu = f$bmu, super = sup, acc = article_accuracy(f$bmu, sup, S$y7), square = FALSE,
+       layers = paste(LAYER_LABELS[meth$layers], collapse = ", "))
+}), res_dir)
+MP <- lapply(MP, function(m) { m$subtitle <- sprintf("accuracy %.3f (all data)", m$acc$accuracy); m })
+p_maps(MP, S$y7)
+```
+
+<p class="note">The article's Fig. 3 for three maps at their median seed: every unit a pie of the tasks it wins, thick
+lines between the 7 super-clusters. Layers of the middle map (chosen on all children): `r MP[[2]]$layers`.</p>
+
+# 10. Is it new?
+
+Three literature searches (`r 66 + 121 + 80` queries; Semantic Scholar, OpenAlex, Crossref, arXiv, the web; abstracts
+and, where open, full texts read; package sources read) for each ingredient:
+
+| Idea | Verdict | Closest published work |
+|---|---|---|
+| A layered map whose lattice **grows** during training | **partly published** | in kernel form: Wijewardena et al. 2015 grow a GSOM whose similarity is a weighted combination of per-source kernels, a kernel analogue of a growing SuperSOM (abstract only). **Not found** in kohonen's form, with arbitrary per-layer distances (DTW, Manhattan) and pulls in the online scheme. Nearby: the archived R package GrowingSOM (2017) has a growing map with a data and a target layer (fixed weights, sum of squares); multi-stream growing maps keep separate lattices (Nawaratne et al. 2020); `kohonen::expandMap` doubles each side of a *trained* map between runs (Wehrens &amp; Kruisselbrink 2018) |
+| Births as the **medoid of the parent's worse-fitting half**, in the multi-layer distance | **not found** | medoid prototypes on fixed maps (Palomino Mariño &amp; de Carvalho 2024); new nodes as the input itself (SOINN, OILFTS 2015) |
+| **Robust layers**: Manhattan winner and clipped pull per layer | **not found** as such | robust SOMs (Allende et al. 2004; L&oacute;pez-Rubio et al. 2015) and a per-layer Manhattan distance in kohonen, separately |
+| **DTW layers** in a SuperSOM | partly published | the R package `sits` runs an adapted copy of kohonen's supersom with one DTW layer per satellite band (winner by DTW, the usual unwarped Kohonen step); kohonen 3.0's own example puts a shift-tolerant curve distance (WCC) layer next to a sum-of-squares feature layer (Wehrens &amp; Kruisselbrink 2018). New here: DTW next to feature layers, with a warped pull |
+| A growing map with **DTW** | published | GSOM Sequence (Fonseka, Alahakoon &amp; Bedingfield, IEEE CIDM 2011) builds DTW into the GSOM; OILFTS (Xu et al. 2015) grows a SOINN network with FastDTW |
+| **Learned layer weights** during training | published | Olteanu &amp; Villa-Vialaneix 2015; Palomino Mariño &amp; de Carvalho 2024 (per-view relevance weights) |
+| A **label layer** (supervised map) | published | xyf / bdk (Melssen et al. 2006; Wehrens &amp; Buydens 2007); growing semi-supervised GSOMs (Hsu &amp; Halgamuge 2008) |
+| A SuperSOM on **wearable IMU** data with feature-set layers | not found | Galea et al. 2021: a supervised super SOM on accelerometer data of cats; human studies use one layer (Mo et al. 2022; Patrikei et al. 2026) |
+
+"Not found" means searched and not found, not proven absent. Two corrections to earlier claims of this project follow:
+growth with DTW is not new (GSOM Sequence, 2011), so the growing DTW-SOM of Step 12 is new only in its medoid births and
+their combination; and DTW layers in a SuperSOM exist in software (`sits`). What remains new, as far as we found: the
+growing map in kohonen's form with DTW and Manhattan layers and its medoid births; and, as an application, a layered map on
+wearable IMU data that recognises children whose gyroscope failed.
+
+# 11. Conclusions
+
+<div class="callout">
+
+* **A layered SOM does not recognise the tasks better than the best single feature set** when every sensor is there:
+  `r f3(mn(L_S, "super"))` against `r f3(mn(O_S, "super"))` under the article's rule, a small deficit when each unit names its
+  task, both confirmed on fresh seeds. The article's question has a short answer: pick one strong feature set and a robust map.
+* **Layering four feature sets with equal weights is worse than the best of them**, because the super-cluster step sees
+  the weak layers as much as the strong ones. If layers are used, choose them on the training children.
+* **The layered map's real use is a missing sensor**: trained on everything, it recognises children from the
+  accelerometer alone `r pt1(ngm("ss_all7") - ngm(best_acc))` points better than a map that only knows the accelerometer,
+  and it would have kept the 9 children the article lost.
+* **Growing does not change the accuracy here, and DTW lowers it in layered maps**; growing is faster, DTW helps a single
+  raw-curve map.
+
+</div>
+
+**Limitations.** One data set (81 children, one study, one sensor position). The article's features were selected
+with XGBoost on all 81 children, which flatters every map that uses them on held-out children (not the raw-curve maps).
+The raw curves are one choice of representation among many. The missing-sensor gain was measured on 9 children
+(72 segments), all from one group of the data set (ids vy01 to vy09), and on a simulation in which `r ac7$better` children
+gained and `r ac7$worse` lost.
+
+# 12. Reproduce
+
+```{.bash .fold-show}
+Rscript run_supersom.R          # all maps, about 2 hours on 17 cores; results go to supersom/results/
+Rscript supersom/tests/test_core.R
+```
+
+Then knit `supersom.Rmd` (a few minutes from the cache; `quick: true` knits a small version).
+
+| File | What it holds |
+|---|---|
+| `supersom/ss_core.cpp` | the layered online SOM: per-layer distances (sum of squares, Manhattan, Euclidean, correlation, DTW) and pulls (clipped, warped), kohonen's winner rule and schedule, the floating radius |
+| `supersom/R/ss_maps.R` | layers, kohonen's layer weights, learned weights, the fixed and the growing map, the layer selection |
+| `supersom/R/ss_protocols.R` | all data, held-out children, layer vote, mapping with a subset of layers |
+| `supersom/R/ss_bench.R` | the 28 maps, the plan, the parallel runs, the cache, the confirmation rule |
+| `supersom/R/ss_raw.R` | the posture curves and spectra from the Zenodo file |
+| `supersom/R/ss_report.R` | the charts and tables of this page |
+| `supersom/tests/test_core.R` | the core against kohonen::som, kohonen::supersom and novel_SOM's DTW |
+
+<details><summary>Sources</summary>
+
+* Wehrens R, Buydens LMC (2007). Self- and super-organizing maps in R: the kohonen package. *J Stat Softw* 21(5).
+* Wehrens R, Kruisselbrink J (2018). Flexible self-organizing maps in kohonen 3.0. *J Stat Softw* 87(7).
+* Wijewardena M, et al. (2015). Heterogeneous data fusion with multiple kernel growing self organizing maps. *SCAI 2015*, FAIA 278, 167-176.
+* Fonseka A, Alahakoon D, Bedingfield S (2011). GSOM sequence: an unsupervised dynamic approach for knowledge discovery in temporal data. *IEEE CIDM*. doi:10.1109/cidm.2011.5949456
+* Palomino Mariño LM, de Carvalho FAT (2024). Self-organizing maps with adaptive distances for multiple dissimilarity matrices. *Machine Learning* 113(10), 7783-7806.
+* Olteanu M, Villa-Vialaneix N (2015). On-line relational and multiple relational SOM. *Neurocomputing* 147.
+* Melssen W, Wehrens R, Buydens L (2006). Supervised Kohonen networks for classification problems. *Chemom Intell Lab Syst* 83.
+* Hsu AL, Halgamuge SK (2008). Class structure visualization with semi-supervised growing self-organizing maps. *Neurocomputing* 71.
+* Allende H, et al. (2004). Robust self-organizing maps. *CIARP*, LNCS 3287. L&oacute;pez-Rubio E, et al. (2015). Robust self-organization with M-estimators. *Neurocomputing* 151.
+* Galea N, Murphy F, Gaschk JL, Schoeman DS, Clemente CJ (2021). Quantifying finer-scale behaviours using self-organising maps (SOMs) to link accelerometery signatures with behavioural patterns in free-roaming terrestrial animals. *Sci Rep* 11, 13566.
+* Shen F, Hasegawa O (2006). An incremental network for on-line unsupervised classification and topology learning. *Neural Netw* 19(1).
+* Xu H, Xing Y, Shen F, Zhao J (2015). An online incremental learning algorithm for time series. *IJCNN 2015*. doi:10.1109/ijcnn.2015.7280833
+* Nawaratne R, Alahakoon D, De Silva D, Kumara H, Yu X (2020). Hierarchical two-stream growing self-organizing maps with transience for human activity recognition. *IEEE Trans Ind Inform* 16(12), 7756-7764.
+* Hunziker A (2017). GrowingSOM: Growing Self-Organizing Maps, R package 0.1.1 (CRAN, archived).
+* Mo L, Yu H, Hua W (2022). Pruning growing self-organizing map network for human physical activity identification. *J Healthc Eng*.
+* `sits`: Satellite image time series analysis, R package (e-sensing, INPE), `R/api_kohonen.R` and `src/kohonen_som.cpp`.
+* Patrikei A, Cuberek R, Halfar R, Martinovi&#269; T (2026). Essential time series characteristics for human motion analysis based on Self-Organizing Map clustering. *Acta Gymnica* 56, e2026.004.
+* Cuberek R, et al. (2024). Physical exercise measurements with accelerometer and gyroscope. Zenodo, doi:10.5281/zenodo.10984137.
+
+</details>
+
+<details><summary>Session information</summary>
+
+```{r session, echo = FALSE}
+sessionInfo()
+```
+
+</details>
