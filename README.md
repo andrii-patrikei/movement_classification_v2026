@@ -45,7 +45,7 @@ all 648 segments, the article's measure: 20 seeds)
 - **Why:** the features are heavy-tailed, and an L1 winner with a clipped pull keeps outlying segments from
   dragging prototypes. Clipping the features at 3 standard deviations helps the classical SOM too (0.803), but
   not as far as the robust SOM goes without it (0.816).
-- **One seed is not a result:** the article's published 0.974 (tsfresh) sits near the top of its own spread;
+- **Seed-to-seed spread:** our published 0.974 (tsfresh) is a single seed near the top of its spread;
   20 seeds of the same `kohonen::som` call give 0.940 on average, from 0.853 to 0.975.
 - **The screening behind the choice:** all 17 novel_SOM variants, each on novel_SOM's own schedule and on the
   article's (34 maps). On its own schedule novel_SOM gains little; the elastic distances (DTW, soft-DTW,
@@ -171,6 +171,11 @@ Cuberek, R., et al. (2024). *Physical exercise measurements with accelerometer a
 
 The code behind the article: https://code.it4i.cz/ADAS/movement-classification (IT4Innovations).
 This repository is an independent reimplementation.
+
+## Acknowledgements
+
+Thanks to my co-authors R. Cuberek, R. Halfar and T. Martinovič, and to the IT4Innovations National
+Supercomputing Center, where the original study was done.
 
 ## License
 
