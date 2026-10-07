@@ -165,8 +165,8 @@ float_diff <- max(sapply(1:2, function(sd) max(abs(fit_ss(S$XL, g4, sd, rlen = S
 <p class="lead">
 A SuperSOM (<code>kohonen::supersom</code>) trains <b>one</b> map on several blocks of data at once, the "layers": every
 layer keeps its own distance and weight, and the winning unit is the one closest over all of them. Here every version
-of it was built from the best ingredients of the earlier reports (the robust Manhattan SOM, the DTW-SOM, the growing
-DTW-SOM of Step 12) and tested the way <code>som_variants.Rmd</code> tested the single maps: the article's 648 segments,
+of it was built from the best ingredients of the earlier reports (the robust Manhattan SOM, the DTW-SOM, and my
+earlier growing DTW-SOM) and tested the way <code>som_variants.Rmd</code> tested the single maps: the article's 648 segments,
 its 5&times;5 map and 7 super-clusters, children the map has never seen, `r n_seeds` seeds, and a confirmation on
 `r n_conf` fresh seeds.
 </p>
@@ -403,8 +403,8 @@ p_weights(WTr, c(ss_rob_F4_agree = "agreement", ss_rob_F4_adapt = "inverse error
 <p class="note">Seed 1, all data, the weights after every pass (pass 0: kohonen's start weights). Inverse error ($w_l \propto$ the layer's length over its
 mean distance to the winner, the maximum-likelihood noise scale) keeps RQA high: its features are correlated and easy to
 fit, and easy to fit is not the same as informative. Agreement ($w_l \propto w_l^0 / (1 + g_l)$, $g_l$ the mean lattice distance, over all segments, between the layer's own
-nearest unit and the winner, recomputed after every pass; a per-pass version of the running-mean rule of the novel_SOM branch
-`claude/loving-fermat-1wvts3`) moves weight away from RQA, mostly in the first pass: seed 1 from `r f3(wr$rqa_0[1])`
+nearest unit and the winner, recomputed after every pass; a per-pass version of a running-mean rule I tried
+in novel_SOM, not published) moves weight away from RQA, mostly in the first pass: seed 1 from `r f3(wr$rqa_0[1])`
 (kohonen's start weight, pass 0) to `r f3(wr$rqa_1[1])`; `r sprintf("%.0f to %.0f%%", -100 * max(wr$rel), -100 * min(wr$rel))`
 less over the `r nrow(wr)` seeds.</p>
 
@@ -475,11 +475,11 @@ the layer-choosing map with curves by sum of squares).</p>
 
 # 8. The growing map
 
-The growing maps are Step 12's growing DTW-SOM with the SuperSOM's distance: seven units to start, then a birth every
+The growing maps are my earlier growing DTW-SOM (not published) with the SuperSOM's distance: seven units to start, then a birth every
 `r round(0.6 * S$rlen / 18)` passes (`r format(round(0.6 * S$rlen * 648 / 18), big.mark = ",")` steps on all 648 segments)
 until 60% of the training, the radius held at one step while the map grows; each child is the medoid (a real segment, in
 every layer at once) of the half of its parent's segments that the parent fits worst; they end with 25 units, like the
-fixed maps. Step 12's floating radius is switched on but does nothing here: with kohonen's bubble neighbourhood on whole
+fixed maps. Its floating radius is switched on but does nothing here: with kohonen's bubble neighbourhood on whole
 steps of the lattice, a radius between 1 and 2 moves the same units as a radius of 1 (with and without it, the growing
 map of the four feature sets ends with `r if (float_diff == 0) "identical codebooks" else sprintf("codebooks that differ by at most %.2g", float_diff)`, seeds 1 and 2).
 
@@ -506,8 +506,8 @@ knitr::kable(GF[, .(Layers = lab[fixed], `TE fixed / growing` = sprintf("%.3f / 
 
 Growing does not change the accuracy beyond the seed noise; it saves `r speed` of the time (fewer units to compare while it
 grows) and orders the map slightly *worse* on the article's schedule: TE higher on average in all four pairs, and on
-most seeds in `r sum(GF$te_lower < GF$seeds / 2)` of them. On the tutorial's
-Gaussian schedule the growing DTW-SOM ordered maps better (Step 12); with kohonen's bubble neighbourhood, whose radius
+most seeds in `r sum(GF$te_lower < GF$seeds / 2)` of them. On a Gaussian
+schedule my growing DTW-SOM ordered maps better; with kohonen's bubble neighbourhood, whose radius
 drops to the winner alone right after the growth, that advantage does not carry over.
 
 # 9. The maps
@@ -524,7 +524,7 @@ MP <- lapply(MP, function(m) { m$subtitle <- sprintf("accuracy %.3f (all data)",
 p_maps(MP, S$y7)
 ```
 
-<p class="note">The article's Fig. 3 for three maps at their median seed: every unit a pie of the tasks it wins, thick
+<p class="note">The article's Fig. 2 for three maps at their median seed: every unit a pie of the tasks it wins, thick
 lines between the 7 super-clusters. Layers of the middle map (chosen on all children): `r MP[[2]]$layers`.</p>
 
 # 10. Is it new?
@@ -543,8 +543,8 @@ and, where open, full texts read; package sources read) for each ingredient:
 | A **label layer** (supervised map) | published | xyf / bdk (Melssen et al. 2006; Wehrens &amp; Buydens 2007); growing semi-supervised GSOMs (Hsu &amp; Halgamuge 2008) |
 | A SuperSOM on **wearable IMU** data with feature-set layers | not found | Galea et al. 2021: a supervised super SOM on accelerometer data of cats; human studies use one layer (Mo et al. 2022; Patrikei et al. 2026) |
 
-"Not found" means searched and not found, not proven absent. Two corrections to earlier claims of this project follow:
-growth with DTW is not new (GSOM Sequence, 2011), so the growing DTW-SOM of Step 12 is new only in its medoid births and
+"Not found" means searched and not found, not proven absent. Two points correct my earlier notes:
+growth with DTW is not new (GSOM Sequence, 2011), so my growing DTW-SOM is new only in its medoid births and
 their combination; and DTW layers in a SuperSOM exist in software (`sits`). What remains new, as far as we found: the
 growing map in kohonen's form with DTW and Manhattan layers and its medoid births; and, as an application, a layered map on
 wearable IMU data that recognises children whose gyroscope failed.

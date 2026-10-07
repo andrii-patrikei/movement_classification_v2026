@@ -192,7 +192,7 @@ p_curve <- function(C, pub, who_cols, who_labels, first = levels(C$set_label)[1]
 }
 
 # ----------------------------------------------------------------------------------------------- the maps
-# The article's Fig. 3 (aweSOM "Pie"): every unit a cell with a pie of the tasks it wins (area by the number of
+# The article's Fig. 2 (aweSOM "Pie"): every unit a cell with a pie of the tasks it wins (area by the number of
 # segments), the 7 super-clusters as thick boundaries. All maps share one coordinate system, side by side, so
 # the cells keep their shape; hovering a cell lists its segments. maps: a list of list(pos, bmu, super, acc,
 # title, subtitle, square), acc being the result of article_accuracy(); y7: the task of every segment.

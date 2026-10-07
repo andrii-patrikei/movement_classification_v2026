@@ -68,7 +68,7 @@ hex_grid <- function(xdim, ydim) {                      # kohonen's hexagonal so
   g <- kohonen::somgrid(xdim, ydim, "hexagonal")
   list(pos = g$pts, dist = kohonen::unit.distances(g), K = nrow(g$pts))
 }
-# the growing lattice (Step 12 of som_vs_dtw_som.Rmd): sites (column, row) of a hexagonal lattice, odd rows
+# the growing lattice (from my earlier growing DTW-SOM): sites (column, row) of a hexagonal lattice, odd rows
 # shifted half a unit; the map distance is the number of steps along the map
 site_pos <- function(sites) cbind(x = sites[, 1] + 0.5 * (sites[, 2] %% 2), y = sites[, 2] * sqrt(3) / 2)
 touching <- function(site, sites) abs(sqrt(colSums((t(site_pos(sites)) - c(site_pos(rbind(site))))^2)) - 1) < 1e-6
@@ -198,7 +198,7 @@ layer_weights <- function(meth, M0, spec, nl_x) {
 #            own; a layer the map fits well counts more (the inverse-variance weights of a weighted mean)
 #   "agree"  w_l = w0_l / (1 + g_l), g_l the mean lattice distance between the layer's own nearest unit and the
 #            winner, w0 kohonen's start weights: a layer that agrees with the consensus counts more, a layer of noise
-#            disagrees with everything (weight_rule 2 of ns_super.cpp, novel_SOM branch claude/loving-fermat-1wvts3)
+#            disagrees with everything (an experimental weight rule of novel_SOM, not published)
 # The label layer of a supervised map keeps its share.
 LEARNED <- c("adapt", "agree")
 train_chunks <- function(X, M, gdist, spec, w, meth, S, r0, grow_steps, N, s_from = 0L, s_to = S, owner = integer(nrow(X)),
@@ -236,7 +236,7 @@ learn_weights <- function(X, M, spec, w, w0, gdist, rule) {
 }
 
 # --------------------------------------------------------------------------------------------- growing
-# Step 12's growing map with the SuperSOM's weighted distance: a unit and its six neighbours to start; births
+# my earlier growing DTW-SOM with the SuperSOM's weighted distance: a unit and its six neighbours to start; births
 # evenly spread over the first grow_share of the steps, each from the unit with the largest total distance to
 # the items it last won; the child is the medoid (a real item, in every layer at once) of the half of the
 # parent's items that the parent fits worst, placed on a free site next to the parent (the one with most

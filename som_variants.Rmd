@@ -143,8 +143,10 @@ The article clustered 648 movement segments (81 children, 7 tasks, crawling reco
 Kohonen Self-Organizing Map and judged how well its clusters recover the tasks. Here the map alone is
 replaced by a **robust SOM** from [novel_SOM](https://github.com/andrii-patrikei/novel_SOM): the winning unit is
 chosen by the Manhattan distance, every update step is clipped at one standard deviation, and the training
-schedule is exactly the article's. The features, the 5&times;5 map, the 7 super-clusters and the accuracy measure
-are the article's own, read from its saved models.
+schedule is exactly the article's, close to the robust SOM of Allende et al. (2004). The features, the 5&times;5
+map, the 7 super-clusters and the accuracy measure are the article's own, read from its saved models. Most of the
+gain comes from handling outliers in the features, and Section 5 shows that clipping the features does most of it
+too.
 </p>
 
 <div class="tiles">
@@ -220,6 +222,11 @@ seventeen variants: nine distances, six with a training ingredient (a clipped pu
 momentum) and two lattices (a rectangular sheet and a torus). Its code is vendored in `novel_som/`, with one
 addition: the bubble neighbourhood of kohonen, which lets any variant run on the article's schedule.
 
+The idea is not new: it is a fixed-scale form of the robust SOM of Allende et al. (2004), which bounds the pull
+with an M-estimator (Allende H, Moreno S, Rogel C, Salas R. Robust self-organizing maps. *CIARP 2004*, LNCS 3287,
+179-186, [doi:10.1007/978-3-540-30463-0_22](https://doi.org/10.1007/978-3-540-30463-0_22)). What this report adds
+is the test on the article's pipeline, with children held out.
+
 ## How it is judged
 
 | | Held fixed (the article's) | Changed |
@@ -232,10 +239,10 @@ addition: the bubble neighbourhood of kohonen, which lets any variant run on the
 
 Three protocols, all with 27 features:
 
-* **All data**, the article's Table 4: one map on all 648 segments (`r n_all` seeds).
+* **All data**, as in the article's results script: one map on all 648 segments (`r n_all` seeds).
 * **Held-out children**: 9 folds of 9 children; the map, its super-clusters and their names come from 72
-  children, and the segments of the other 9 are predicted (`r n_cv` seeds). This is the honest test of recognising
-  movement in a new child.
+  children, and the segments of the other 9 are predicted (`r n_cv` seeds). This is the test that matches the
+  question of recognising movement in a new child.
 * **Confirmation**: the screening winner against the classical SOM again, on `r n_conf` fresh seeds (new starts, new
   orders of segments, new folds of children), with every prediction kept for a child-by-child comparison.
 
@@ -422,10 +429,11 @@ knitr::kable(out[match(c("Accuracy, all data (the map's own distance)", "Accurac
 * **The map stays a map.** Its topographic error averages `r sprintf("%.2f", mean(per_set("TE", ROBUST)))`, against
   `r sprintf("%.2f", mean(per_set("TE", CLASSIC)))` for the classical SOM, so the lattice is `r if (mean(per_set("TE", ROBUST)) <= mean(per_set("TE", CLASSIC))) "at least as well ordered" else "about as well ordered"`.
 
-## The article's Table 4
+## The article's quality measures
 
-Every measure of the article's Table 4, for every map and feature set (means over the seeds; the article's
-published map, one seed, for comparison). Filter by feature set or map, sort any column.
+Every measure that the article's results script (`get_results.Rmd`) saves with its maps, for every map and
+feature set (means over the seeds; the article's published map, one seed, for comparison). Filter by feature set
+or map, sort any column.
 
 ```{r table4, echo = FALSE}
 w <- dcast(S[n == 27], set + method ~ measure, value.var = c("mean", "sd"))
@@ -441,8 +449,10 @@ dt_table(t4, round_cols = names(t4)[3:ncol(t4)], page = 10, filter = "top")
 ```
 
 <p class="note">QE, EV, TE and KL are the Euclidean measures of <code>aweSOM::somQuality</code>, as in the article.
-The article's k-fold "test" trains a new map on the test quarter and scores it on that same quarter, so it is not a
-prediction for unseen data; the held-out columns are.</p>
+A note on my own code: the k-fold I wrote for the article (<code>train_som_cv()</code>) trains a new map on the test
+quarter and scores it on that same quarter, so its "test" is not a prediction for unseen data; the held-out columns
+are. With children held out, the classical tsfresh map still reaches
+`r f3(per_set("heldout_super_acc", CLASSIC)[["tsfresh"]])`, so the article's conclusion (above 90%) holds.</p>
 
 # 5. Why it works: the features have outliers
 
@@ -483,12 +493,26 @@ w_mean <- function(m) W[method == m & !is.na(heldout_super_acc), .(v = mean(held
 knitr::kable(wt, digits = 3, caption = sprintf("Accuracy on held-out children with the features as the article used them and clipped at 3 sd (%d seeds)", W[method == CLASSIC & !is.na(heldout_super_acc), uniqueN(seed)]))
 ```
 
+```{r winsor-l1, echo = FALSE}
+# the simplest robust option on the clipped features: a Manhattan winner and the usual pull, which is what
+# kohonen::som offers with dist.fcts = "manhattan"; a cache of its own, so the run above stays as it is
+L1 <- "manhattan:article"
+w1jobs <- make_jobs(names(SETS), 27, L1, if (params$quick) 1:2 else 1:10, "heldout")
+W1 <- cached("somvar_winsor3_l1", bench_key(w1jobs[, c("set", "n", "method", "seed", "protocols")], 10, D$md5, "features clipped at 3 sd, Manhattan winner"),
+             function() run_jobs(w1jobs, Dw, 10, cores), res_dir)
+w1_mean <- W1[!is.na(heldout_super_acc), .(v = mean(heldout_super_acc)), by = set][, mean(v)]
+```
+
 Clipping lifts the classical SOM from `r f3(kh$heldout_super_acc)` to `r f3(w_mean(CLASSIC))` on held-out children
 (mean of the five feature sets), while the robust SOM moves from `r f3(rb$heldout_super_acc)` to `r f3(w_mean(ROBUST))`.
-Most of the gain is robustness to outliers, which the robust SOM gets without touching the data or choosing a
-threshold`r if (rb$heldout_super_acc > w_mean(CLASSIC)) ", and it stays the more accurate map" else ""`.
+A Manhattan winner alone, without the clipped pull (the option `dist.fcts = "manhattan"` of `kohonen::som`),
+reaches `r f3(w1_mean)` on the clipped features. Most of the gain is robustness to outliers, and simple means get
+most of it: clipping the features at 3 sd, or the robust SOM's own clipped pull, which is a threshold too (1 sd).
+The robust SOM on the features as they are (`r f3(rb$heldout_super_acc)`) is `r if (abs(rb$heldout_super_acc - w1_mean) < 0.005) "level with" else if (rb$heldout_super_acc > w1_mean) "ahead of" else "behind"`
+a Manhattan winner on clipped features (`r f3(w1_mean)`): its advantage is that it needs no preprocessing step, not
+that it recognises the tasks better.
 
-# 6. The number of features: Table 5 and beyond
+# 6. The number of features: 24 to 27 and beyond
 
 The article compared 24 to 27 features and chose 27. Its saved maps cover 2 to 35 features, one seed each.
 
@@ -521,13 +545,13 @@ if (nrow(t5)) {
   t5 <- merge(t5, pubs[n %in% 24:27, .(set, n, published = sprintf("%.3f", accuracy))], by = c("set", "n"))
   t5 <- t5[order(match(set, names(SETS)), n), .(`Feature set` = SETS[set], Features = n, `The article (one seed)` = published,
                                                   `Classical SOM` = get(CLASSIC), `Robust SOM` = get(ROBUST))]
-  knitr::kable(t5, caption = sprintf("The article's Table 5: accuracy on all data, 24 to 27 features (mean &plusmn; sd over %d seeds)", nseeds_curve))
+  knitr::kable(t5, caption = sprintf("The article's maps with 24 to 27 features: accuracy on all data (mean &plusmn; sd over %d seeds)", nseeds_curve))
 }
 ```
 
 # 7. The maps
 
-The article's Fig. 3, redrawn: each unit a pie of the tasks it wins (area by the number of segments), thick lines
+The article's Fig. 2, redrawn: each unit a pie of the tasks it wins (area by the number of segments), thick lines
 between the 7 super-clusters. The classical and the robust SOM are shown at their median seed, a representative
 run rather than the best one. Hover a unit for its segments.
 
@@ -559,7 +583,7 @@ p_maps(maps_sp, D$y7)
 p_maps(maps_ts, D$y7)
 ```
 
-<details><summary>The article's Table 6: segments per super-cluster and task, tsfresh maps</summary>
+<details><summary>Segments per super-cluster and task, tsfresh maps</summary>
 
 ```{r table6, echo = FALSE, results = "asis"}
 for (m in maps_ts) {
@@ -585,8 +609,14 @@ for (m in maps_ts) {
   `r pts(per_set("heldout_super_acc", ROBUST)[["mix"]] - per_set("heldout_super_acc", CLASSIC)[["mix"]])` points.`r if (spec_beats_all) paste0(" With the robust SOM the spectral features (", f3(ho_rb[["spectr"]]), ") do better than the classical SOM on any feature set, including the article's tsfresh choice (", f3(ho_cl[["tsfresh"]]), ").") else ""`
 * **Why:** the features are heavy-tailed, and an L1 winner with a clipped pull keeps outlying segments from
   dragging prototypes. Clipping the features helps the classical SOM too (`r f3(w_mean(CLASSIC))` on held-out
-  children), `r if (w_mean(CLASSIC) < rb$heldout_super_acc) "but not as far as the robust SOM goes without clipping" else "about as far as the robust SOM goes"` (`r f3(rb$heldout_super_acc)`).
-* **Results from one seed are fragile.** The article's published `r f3(pubs[n == 27 & set == "tsfresh"]$accuracy)` (tsfresh) sits near
+  children), `r if (w_mean(CLASSIC) < rb$heldout_super_acc) "but not as far as the robust SOM goes without clipping" else "about as far as the robust SOM goes"` (`r f3(rb$heldout_super_acc)`),
+  and a Manhattan winner alone on the clipped features reaches `r f3(w1_mean)`. Most of the gain is the handling of
+  outliers, not the map itself; the robust SOM is close to that of Allende et al. (2004).
+* **The size of the gain depends on the rule that names the tasks.** With the article's 7 super-clusters it is
+  `r pts(rb$heldout_super_acc - kh$heldout_super_acc)` points; when each of the 25 units names its own task, it is
+  `r pts(mean(per_set("heldout_unit_acc", ROBUST)) - mean(per_set("heldout_unit_acc", CLASSIC)))` points
+  (`r f3(mean(per_set("heldout_unit_acc", CLASSIC)))` to `r f3(mean(per_set("heldout_unit_acc", ROBUST)))`).
+* **Results from one seed are fragile.** Our published tsfresh map scores `r f3(pubs[n == 27 & set == "tsfresh"]$accuracy)` on all data, near
   the top of its own spread: `r n_all` seeds of the same call give `r f3(S[n == 27 & set == "tsfresh" & method == CLASSIC & measure == "accuracy"]$mean)` on average, from
   `r f3(S[n == 27 & set == "tsfresh" & method == CLASSIC & measure == "accuracy"]$min)` to
   `r f3(S[n == 27 & set == "tsfresh" & method == CLASSIC & measure == "accuracy"]$max)`. Reporting the mean and spread over seeds,

@@ -1,6 +1,6 @@
 # SOM variants on the article's features
 
-2026-10-03: the article's feature matrices (27 features, top XGBoost gain), 5 x 5 maps, 7 PAM super-clusters; all data with 20 seeds, held-out children (9 folds of 9 children) with 10 seeds. Means over the five feature sets, then held-out accuracy per feature set.
+2026-10-07: the article's feature matrices (27 features, top XGBoost gain), 5 x 5 maps, 7 PAM super-clusters; all data with 20 seeds, held-out children (9 folds of 9 children) with 10 seeds. Means over the five feature sets, then held-out accuracy per feature set.
 
 |Map                                                             |Schedule                |Elastic distance |Held-out, super-clusters |Held-out, unit majority |All data (article) |Article's k-fold test |Topographic error |Held-out, RQA |Held-out, Autocorrelation |Held-out, Spectral |Held-out, Mix |Held-out, tsfresh (all) |
 |:---------------------------------------------------------------|:-----------------------|:----------------|:------------------------|:-----------------------|:------------------|:---------------------|:-----------------|:-------------|:-------------------------|:------------------|:-------------|:-----------------------|
