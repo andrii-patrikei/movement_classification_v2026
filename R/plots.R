@@ -101,7 +101,7 @@ diff_plot <- function(Dd, title = NULL, subtitle = NULL, caption = NULL, xlab = 
 }
 
 # ------------------------------------------------------------------------------------------- the maps
-# the article's Fig. 3 (aweSOM "Pie"): every unit a hexagon with a pie of the tasks it wins, the 7
+# the article's Fig. 2 (aweSOM "Pie"): every unit a hexagon with a pie of the tasks it wins, the 7
 # super-clusters as thick boundaries between units
 hex_pie_map <- function(grid_pos, bmu, y7, super, title = NULL, subtitle = NULL, square = FALSE) {
   K <- nrow(grid_pos)

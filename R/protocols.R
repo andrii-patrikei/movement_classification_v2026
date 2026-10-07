@@ -1,8 +1,8 @@
 # protocols.R: the three ways a map is judged in som_variants.Rmd
 #
-# (a) all data      the article's Table 4: one map on all 648 segments; QE, EV, TE, KL (Euclidean, as
+# (a) all data      as the article's results script: one map on all 648 segments; QE, EV, TE, KL (Euclidean, as
 #                   aweSOM::somQuality), the article's accuracy and mnLogLoss, and the ARI of the 7 super-clusters
-# (b) article k-fold the article's own k-fold, as train_som_cv() does it: 4 folds stratified by the 8 segment
+# (b) article k-fold the k-fold I wrote for the article, as train_som_cv() does it: 4 folds stratified by the 8 segment
 #                   labels; "train" = a map on 3/4 judged on those 3/4; "test" = a new map trained on the
 #                   remaining 1/4 and judged on that 1/4 (so neither number is a prediction for unseen data)
 # (c) held-out      what the article's test was meant to be: 9 folds of 9 children; the map, its super-clusters

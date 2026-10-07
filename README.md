@@ -11,8 +11,8 @@ and alternatives to that pipeline, every model judged on children it has never s
 
 | Report | What it shows |
 |---|---|
-| [`som_variants.Rmd`](som_variants.Rmd), **[interactive report](https://andrii-patrikei.github.io/movement_classification_v2026/)** | the article's features and pipeline with a **robust SOM**: 8.2 points more accurate on children the map has never seen |
-| [`movement_alternatives.Rmd`](movement_alternatives.Rmd) | DTW-SOM, RQA + catch22, MiniRocket and Mantis next to the article's approach |
+| [`som_variants.Rmd`](som_variants.Rmd), **[interactive report](https://andrii-patrikei.github.io/movement_classification_v2026/)** | the article's features and pipeline with a **robust SOM** (close to Allende et al. 2004): 8.2 points more accurate on held-out children, most of it from handling outliers in the features |
+| [`movement_alternatives.Rmd`](movement_alternatives.Rmd) | exploratory: DTW-SOM, RQA + catch22 and XGBoost next to the article's approach (a quick run on 24 children) |
 | [`supersom.Rmd`](supersom.Rmd), **[interactive report](https://andrii-patrikei.github.io/movement_classification_v2026/supersom.html)** | layered (SuperSOM), growing and DTW maps: no more accurate than the best single map, but they recognise children whose gyroscope failed |
 
 ## A robust SOM for the article's pipeline
@@ -22,8 +22,9 @@ Kohonen SOM. `som_variants.Rmd` keeps everything else of the article (its featur
 models; the 5 x 5 map; the 7 PAM super-clusters; its accuracy and quality measures) and replaces only the map
 with a **robust SOM** from [novel_SOM](https://github.com/andrii-patrikei/novel_SOM): the winning unit is chosen
 by the Manhattan distance and every update step is clipped at one standard deviation, on exactly the article's
-training schedule. The article's measures are reproduced to the last digit from its 170 saved maps, and its
-published map retrains bit for bit.
+training schedule. This is a fixed-scale form of the robust SOM of Allende et al. (2004), *Robust self-organizing
+maps*, CIARP 2004, LNCS 3287, 179-186. The article's measures are reproduced to the last digit from its 170 saved
+maps, and its published map retrains bit for bit.
 
 **Accuracy with 27 features**, mean over seeds (children the map has never seen: 9 folds of 9 children, 10 seeds;
 all 648 segments, the article's measure: 20 seeds)
@@ -43,10 +44,17 @@ all 648 segments, the article's measure: 20 seeds)
   better and none worse; on autocorrelation 76 better and 4 worse, on Mix 78 and 3, on tsfresh 61 and 18 (paired
   Wilcoxon signed-rank tests, Holm-adjusted p < 0.0001).
 - **Why:** the features are heavy-tailed, and an L1 winner with a clipped pull keeps outlying segments from
-  dragging prototypes. Clipping the features at 3 standard deviations helps the classical SOM too (0.803), but
-  not as far as the robust SOM goes without it (0.816).
-- **Seed-to-seed spread:** our published 0.974 (tsfresh) is a single seed near the top of its spread;
-  20 seeds of the same `kohonen::som` call give 0.940 on average, from 0.853 to 0.975.
+  dragging prototypes.
+- **How much of the gain is the map itself:** little; most of it is handling outliers, which simpler means also
+  do. Clipping the features at 3 standard deviations lifts the classical SOM from 0.734 to 0.803, and a
+  Manhattan winner alone (`kohonen::som` offers it as `dist.fcts = "manhattan"`) on the clipped features reaches
+  0.818, level with the robust SOM (0.816; 0.820 on clipped features). The robust SOM's advantage is that it
+  needs no preprocessing step. When each of the 25 units names its own task instead of the 7 super-clusters, the
+  gain is +2.0 points (0.897 to 0.916).
+- **Caveat for every number above:** the article chose its 27 features with XGBoost on all 81 children, so the
+  held-out accuracies are optimistic for both maps; the comparison between the maps stays fair.
+- **Seed-to-seed spread:** our published tsfresh map (seed 1245) scores 0.974 on all 648 segments, near the top
+  of its spread; 20 seeds of the same `kohonen::som` call give 0.940 on average, from 0.853 to 0.975.
 - **The screening behind the choice:** all 17 novel_SOM variants, each on novel_SOM's own schedule and on the
   article's (34 maps). On its own schedule novel_SOM gains little; the elastic distances (DTW, soft-DTW,
   shape-based) do not suit feature vectors, which have no time axis.
@@ -58,7 +66,7 @@ the child's tasks better
 
 <img src="figures/som-variants-children.png" width="760">
 
-**The maps**, the article's Fig. 3 on the spectral features: the robust SOM gives almost every task its own
+**The maps**, the article's Fig. 2 on the spectral features: the robust SOM gives almost every task its own
 super-cluster
 
 <img src="figures/som-variants-maps-spectral.png" width="760">
@@ -107,19 +115,21 @@ chosen layer weights, beats the best single map. The core (`supersom/ss_core.cpp
 
 ## Alternatives to the pipeline
 
+**Exploratory.** The committed results are a quick run (24 children, 5 folds, one repeat), not the full protocol.
+
 `movement_alternatives.Rmd` re-runs the article's approach on the same open data under a child-grouped
 cross-validation protocol, next to:
 
 - DTW-SOM on raw 4 s windows and on whole segments of different lengths ([dtwsom](https://github.com/andrii-patrikei/dtwsom))
 - RQA features with a recurrence-rate threshold ([chaos-rcpp](https://github.com/andrii-patrikei/chaos-rcpp)) plus catch22, with XGBoost and a kohonen SOM
-- MiniRocket + ridge classifier ([aeon](https://www.aeon-toolkit.org))
-- Mantis, a pretrained time-series foundation model: frozen embeddings + random forest (optional)
+- MiniRocket + ridge classifier ([aeon](https://www.aeon-toolkit.org)) and Mantis, a pretrained time-series
+  foundation model (frozen embeddings + random forest): both optional and not in the committed results
 
 Every model is evaluated on children it has not seen. The document also draws the SOM maps:
 DTW-SOM codebooks of different lengths with the segments mapped to them, and the feature SOM.
 
 Figures from a knit on the Zenodo data; every real-data run regenerates them in `figures/`.
-The numbers of the latest run: [figures/results_table.md](figures/results_table.md).
+The numbers of the latest (quick) run: [figures/results_table.md](figures/results_table.md).
 
 **Balanced accuracy on held-out children**, per method and fold
 

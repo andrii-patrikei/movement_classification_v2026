@@ -19,10 +19,10 @@
 // within a relative 1e-8: an extra uniform draw), the same linear decay of alpha and radius with kohonen's 0.5
 // below 1, the same update. With several SUMSQ layers it is kohonen::supersom.
 //
-// The growing map (supersom.Rmd, after Step 12 of som_vs_dtw_som.Rmd): the loop runs in chunks between births;
+// The growing map (supersom.Rmd, after my earlier growing DTW-SOM): the loop runs in chunks between births;
 // it keeps, for every item, the unit that won it last and that distance (owner, err), and for every unit a
 // running share of folds (the runner-up of its items is not a lattice neighbour); a unit with many folds pulls
-// with a wider radius, r (1 + float * folds). The births themselves happen in R (ss_grow.R).
+// with a wider radius, r (1 + float * folds). The births themselves happen in R (grow_ss() in R/ss_maps.R).
 //
 // [[Rcpp::plugins(cpp17)]]
 #include <Rcpp.h>
@@ -179,7 +179,7 @@ List ss_train_cpp(NumericMatrix X, NumericMatrix M0, NumericMatrix grid_dist,
     if (s < grow_steps) r = radius[0];
     else { double t2 = (double) (s - grow_steps) / (double) (s_total - grow_steps); r = radius[0] - (radius[0] - radius[1]) * t2; }
     if (half_rule && r < 1.0) r = 0.5;
-    // 3. the floating radius of the winner (Step 12): a running share of folds at this unit
+    // 3. the floating radius of the winner (from the growing DTW-SOM): a running share of folds at this unit
     if (floatf > 0 && K > 1) {
       int second = -1; double sd = DBL_MAX;
       for (int k = 0; k < K; k++) if (k != nearest && dist[k] < sd) { sd = dist[k]; second = k; }

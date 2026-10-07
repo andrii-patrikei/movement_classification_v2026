@@ -69,7 +69,7 @@ make_jobs <- function(sets, n_range, methods, seeds, protocols = c("all", "kfold
 #            the held-out children with the first 10 seeds, for the methods whose distance means something on a
 #            feature vector (the elastic ones, and Minkowski under the article's schedule at 37 s a map, are
 #            judged on all data only)
-#   curve    2 to 35 features (the article's range; its Table 5 is 24 to 27): all data, 10 seeds, kohonen, the
+#   curve    2 to 35 features (the article's range; it compared 24 to 27): all data, 10 seeds, kohonen, the
 #            variants meaningful on features under the article's schedule (without Minkowski), and the
 #            Euclidean control under novel_SOM's own schedule
 #   confirm  the variant the screening picks (Section 3 of the report: the best held-out accuracy over the five
